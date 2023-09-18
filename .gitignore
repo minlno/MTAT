@@ -3,5 +3,6 @@
 *.cmd
 *.dwo
 *.ko
+tags
 Module.symvers
 modules.order

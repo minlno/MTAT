@@ -1,3 +1,6 @@
+#ifndef __MTAT__
+#define __MTAT__
+
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/kernel.h>
@@ -46,10 +49,24 @@ struct mtat_page {
 	int hotness;
 	int pids_idx;
 	int nid;
-
 	struct rhash_head node;
 	struct list_head list;
+	spinlock_t lock;
 };
+
+struct mtat_page *alloc_and_init_mtat_page(struct page *page);
+
+struct page_list {
+	struct list_head list;
+	int num_pages;
+	spinlock_t lock;
+};
+
+int get_num_pages(struct page_list *pl); // TODO
+void page_list_del(struct list_head *page, struct page_list *list); // TODO, num_page 카운팅도 수행.
+void page_list_add(struct list_head *page, struct page_list *list); // TODO, num_page 카운팅도 수행.
+void init_page_list(struct page_list *list); //TODO
+
 
 /*
  * PEBS sampling
@@ -61,3 +78,24 @@ struct mtat_page {
 #define DRAM_READ 0x01d3
 #define STORE_ALL 0x82d0
 #define SAMPLE_PERIOD_PEBS 10007
+
+/*
+ * Migration
+ */
+enum migration_modes {
+	SOLORUN,
+	CORUN,
+	HEMEM,
+	TEST_MODE
+};
+
+#define MTAT_MIGRATION_MODE SOLORUN
+#define WARM_SET_SIZE 0 // 2MB page 갯수
+#define ENABLE_MIGRATION 1
+
+struct migration_target_control {
+	int nid;
+	int pid;
+};
+
+#endif /* __MTAT__ */

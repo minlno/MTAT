@@ -1,16 +1,76 @@
 #include "mtat.h"
 
 /*
- * Page list related variables
+ * Page list related variables and functions
+ *
+ * lock 규칙:
+ * - list_del, list_add 모두 mtat_page->lock,  page_list->lock 잡은 후 수행.
+ *
+ * lock 순서:
+ *  mtat_page->lock
+ *    page_list->lock, lock
  */
-static uint64_t global_clock[MAX_PIDS];
+static atomic_t global_clock[MAX_PIDS];
 static int pids[MAX_PIDS];
-static int num_pages[MAX_PIDS][NR_MEM_TYPES][NR_HOTNESS_TYPES];
-static struct list_head f_pages[NR_MEM_TYPES]; // free_pages
-static struct list_head hot_pages[MAX_PIDS][NR_MEM_TYPES];
-static struct list_head cold_pages[MAX_PIDS][NR_MEM_TYPES];
-// TODO: lock 최적화 하기 (리스트 별로 lock 별도로 관리 + page 별로 락 관리)
 static spinlock_t lock;
+
+static struct page_list f_pages[NR_MEM_TYPES]; // free_pages
+static struct page_list hot_pages[MAX_PIDS][NR_MEM_TYPES];
+static struct page_list cold_pages[MAX_PIDS][NR_MEM_TYPES];
+
+struct mtat_page *alloc_and_init_mtat_page(struct page *page)
+{
+	struct mtat_page *m_page = kmalloc(sizeof(*m_page), GFP_KERNEL);
+
+	if (!m_page)
+		return NULL;
+
+	m_page->page = page;
+	m_page->pfn = page_to_pfn(page) << PAGE_SHIFT >> HPAGE_SHIFT;
+	memset(m_page->accesses, 0, sizeof(m_page->accesses));
+	m_page->local_clock = 0;
+	m_page->hotness = COLD;
+	m_page->pids_idx = PID_NONE;
+	m_page->nid = page_to_nid(page);
+	INIT_LIST_HEAD(&m_page->list);
+	spin_lock_init(&m_page->lock);
+
+	return m_page;
+}
+
+int get_num_pages(struct page_list *pl)
+{
+	int num_pages;
+
+	spin_lock(&pl->lock);
+	num_pages = pl->num_pages;
+	spin_unlock(&pl->lock);
+
+	return num_pages;
+}
+
+void page_list_del(struct list_head *page, struct page_list *pl)
+{
+	spin_lock(&pl->lock);
+	list_del(page);
+	pl->num_pages--;
+	spin_unlock(&pl->lock);
+}
+
+void page_list_add(struct list_head *page, struct page_list *pl)
+{
+	spin_lock(&pl->lock);
+	list_add(page, &pl->list);
+	pl->num_pages++;
+	spin_unlock(&pl->lock);
+}
+
+void init_page_list(struct page_list *pl)
+{
+	INIT_LIST_HEAD(&pl->list);
+	pl->num_pages = 0;
+	spin_lock_init(&pl->lock);
+}
 
 static int pid_to_idx(int pid)
 {
@@ -73,13 +133,13 @@ static void destroy_hashtable(void)
 }
 
 /*
- * kthread for debugging
+ * kmonitord thread for debugging
  */
 static struct task_struct *kmonitord;
 
 static void print_num_pages(void)
 {
-	int i, j, k;
+	int i, j;
 
 	for (i = 0; i < MAX_PIDS; i++) {
 		if (pids[i] == PID_NONE)
@@ -87,12 +147,9 @@ static void print_num_pages(void)
 		pr_info("pid: %d\n", pids[i]);
 		for (j = 0; j < NR_MEM_TYPES; j++) {
 			pr_info("--numa node: %d\n", j);
-			for (k = 0; k < NR_HOTNESS_TYPES; k++) {
-				if (k == HOT)
-					pr_info("----hot_pages: %d\n", num_pages[i][j][k]);
-				else
-					pr_info("----cold_pages: %d\n", num_pages[i][j][k]);
-			}
+			pr_info("----free_pages: %d\n", get_num_pages(&f_pages[j]));
+			pr_info("----hot_pages: %d\n", get_num_pages(&hot_pages[i][j]));
+			pr_info("----cold_pages: %d\n", get_num_pages(&cold_pages[i][j]));
 		}
 	}
 }
@@ -101,9 +158,9 @@ static void print_num_pages(void)
 static int kmonitord_main(void *data)
 {
 	while (!kthread_should_stop()) {
-		print_num_pages();
+		//print_num_pages();
 
-		ssleep(1);
+		ssleep(4);
 	}
 
 	return 0;
@@ -116,20 +173,22 @@ static int kmonitord_main(void *data)
 static struct perf_event **events;
 static size_t configs[] = { DRAM_READ, PMEM_READ, STORE_ALL };
 
+// m_page->lock을 잡고 호출해야함.
 static void make_hot_page(struct mtat_page *m_page, int pid_idx, int nid)
 {
+	pr_info("%s\n", __func__);
 	m_page->hotness = HOT;
-	list_move(&m_page->list, &hot_pages[pid_idx][nid]);
-	num_pages[pid_idx][nid][COLD]--;
-	num_pages[pid_idx][nid][HOT]++;
+	page_list_del(&m_page->list, &cold_pages[pid_idx][nid]);
+	page_list_add(&m_page->list, &hot_pages[pid_idx][nid]);
 }
 
+// m_page->lock을 잡고 호출해야함.
 static void make_cold_page(struct mtat_page *m_page, int pid_idx, int nid)
 {
+	pr_info("%s\n", __func__);
 	m_page->hotness = COLD;
-	list_move(&m_page->list, &cold_pages[pid_idx][nid]);
-	num_pages[pid_idx][nid][HOT]--;
-	num_pages[pid_idx][nid][COLD]++;
+	page_list_del(&m_page->list, &hot_pages[pid_idx][nid]);
+	page_list_add(&m_page->list, &cold_pages[pid_idx][nid]);
 }
 
 static uint64_t perf_virt_to_phys(u64 virt)
@@ -167,19 +226,17 @@ static void pebs_sample(struct perf_event *event,
 	struct mtat_page *m_page = NULL;
 
 	pfn = perf_virt_to_phys(data->addr) >> HPAGE_SHIFT;
-	//pr_info("sampled pfn: %lu\n", pfn);
 	m_page = rhashtable_lookup_fast(hashtable, &pfn, params);
 	if (!m_page) {
 		return;
 	}
-	//pr_info("%s: Found mtat_page from hashtable\n", __func__);
 
 	
-	spin_lock(&lock);
+	spin_lock(&m_page->lock);
 
 	pid_idx = m_page->pids_idx;
 	nid = m_page->nid;
-	pid = pids[pid_idx];
+	pid = pids[pid_idx]; // pids[i]는 한번 쓰이면 값이 변하지 않음. lock잡을 필요 X
 
 
 	m_page->accesses[access_type]++;
@@ -196,12 +253,16 @@ static void pebs_sample(struct perf_event *event,
 			make_cold_page(m_page, pid_idx, nid);
 	}
 
-	m_page->accesses[access_type] >>= global_clock[pid_idx] - m_page->local_clock;
-	m_page->local_clock = global_clock[pid_idx];
-	if (m_page->accesses[access_type] > COOL_THRESHOLD)
-		global_clock[pid_idx]++;
+	pr_info("Before access count: %lld\n", m_page->accesses[access_type]);
+	m_page->accesses[access_type] >>= atomic_read(&global_clock[pid_idx]) - m_page->local_clock;
+	pr_info("After access count: %lld\n", m_page->accesses[access_type]);
+	m_page->local_clock = atomic_read(&global_clock[pid_idx]);
+	if (m_page->accesses[access_type] > COOL_THRESHOLD) {
+		pr_info("cooling\n");
+		atomic_inc(&global_clock[pid_idx]);
+	}
 
-	spin_unlock(&lock);
+	spin_unlock(&m_page->lock);
 }
 
 static void pebs_start(void)
@@ -259,23 +320,16 @@ static void pebs_stop(void)
 	vfree(events);
 }
 
+/*
+ * Page allocation & free
+ */
 static int add_new_page(struct page *page)
 {
-	int i, err;
-	struct mtat_page *m_page = kmalloc(sizeof(*m_page), GFP_KERNEL);
-	if (!m_page) {
-		pr_err("Failed to allocate mtat_page\n");
-		return -1;
-	}
+	int err, nid;
+	struct mtat_page *m_page = alloc_and_init_mtat_page(page);	
 
-	m_page->page = page;
-	m_page->pfn = page_to_pfn(page) << PAGE_SHIFT >> HPAGE_SHIFT;
-	pr_info("inserted pfn: %llu\n", m_page->pfn);
-	INIT_LIST_HEAD(&m_page->list);
-	list_add_tail(&m_page->list, &f_pages[page_to_nid(page)]);
-	for (i = 0; i < NR_ACCESS_TYPES; i++)
-		m_page->accesses[i] = 0;
-
+	nid = page_to_nid(page);
+	page_list_add(&m_page->list, &f_pages[nid]);
 	err = rhashtable_insert_fast(hashtable, &m_page->node, params);
 	if (err) {
 		kfree(m_page);
@@ -289,7 +343,6 @@ static int add_new_page(struct page *page)
 static int add_freed_page(struct page *page)
 {
 	uint64_t pfn = page_to_pfn(page) << PAGE_SHIFT >> HPAGE_SHIFT;
-	int nid = page_to_nid(page);
 	struct mtat_page *m_page = rhashtable_lookup_fast(hashtable, &pfn, params);
 
 	if (!m_page) {
@@ -297,35 +350,35 @@ static int add_freed_page(struct page *page)
 		return 0;
 	}
 
-	spin_lock(&lock);
-	list_move(&m_page->list, &f_pages[nid]);
-	num_pages[m_page->pids_idx][nid][m_page->hotness]--;
+	spin_lock(&m_page->lock);
 
-	print_num_pages();
+	if (m_page->hotness == HOT)
+		page_list_del(&m_page->list, &hot_pages[m_page->pids_idx][m_page->nid]);
+	else
+		page_list_del(&m_page->list, &cold_pages[m_page->pids_idx][m_page->nid]);
+	page_list_add(&m_page->list, &f_pages[m_page->nid]);
 
-	spin_unlock(&lock);
+	spin_unlock(&m_page->lock);
 
 	return 0;
 }
 
 static void build_page_list(void)
 {
-	int i, j, k, nid, nb_pages = 0;
+	int i, j, nid, nb_pages = 0;
 	struct hstate *h;
 	struct page *page;
 	//bool pin = !!(current->flags & PF_MEMALLOC_PIN);
 
 	spin_lock_init(&lock);
 	memset(global_clock, 0, sizeof(global_clock));
-	for (i = 0; i < NR_MEM_TYPES; i++)
-		INIT_LIST_HEAD(&f_pages[i]);
+	for (i = 0; i < NR_MEM_TYPES; i++) 
+		init_page_list(&f_pages[i]);
 	for (i = 0; i < MAX_PIDS; i++) {
 		pids[i] = PID_NONE;
 		for (j = 0; j < NR_MEM_TYPES; j++) {
-			INIT_LIST_HEAD(&hot_pages[i][j]);
-			INIT_LIST_HEAD(&cold_pages[i][j]);
-			for (k = 0; k < NR_HOTNESS_TYPES; k++)
-				num_pages[i][j][k] = 0;
+			init_page_list(&hot_pages[i][j]);
+			init_page_list(&cold_pages[i][j]);
 		}
 	}
 
@@ -335,8 +388,10 @@ static void build_page_list(void)
 				//if (pin && !is_pinnable_page(page))
 				//	continue;
 
-				if (PageHWPoison(page))
+				if (PageHWPoison(page)) {
+					pr_info("poison\n");
 					continue;
+				}
 
 				nb_pages++;
 				if (add_new_page(page) != 0)
@@ -354,26 +409,31 @@ static void reserve_page(struct hstate *h, int nid, pid_t pid,
 	int i;
 
 	spin_lock(&lock);
-
 	for (i = 0; i < MAX_PIDS; i++) {
 		if (pids[i] == PID_NONE || pids[i] == pid)
 			break;
 	}
-
 	if (i == MAX_PIDS) {
 		pr_err("Too many pids!\n");
+		spin_unlock(&lock);
 		return;
 	}
+	if (pids[i] == PID_NONE)
+		pids[i] = pid;
+	spin_unlock(&lock);
 
-	m_page->local_clock = global_clock[i];
+	spin_lock(&m_page->lock);
+
+	m_page->local_clock = atomic_read(&global_clock[i]);
 	m_page->hotness = COLD;
 	m_page->pids_idx = i;
 	m_page->nid = nid;
-	pids[i] = pid;
-	list_move(&m_page->list, &cold_pages[i][nid]);
-	num_pages[i][nid][COLD]++;
+	memset(m_page->accesses, 0, sizeof(m_page->accesses));
+	page_list_del(&m_page->list, &f_pages[nid]);
+	page_list_add(&m_page->list, &cold_pages[i][nid]);
 
-	spin_unlock(&lock);
+	spin_unlock(&m_page->lock);
+
 
 	list_move(&m_page->page->lru, &h->hugepage_activelist);
 	set_page_count(m_page->page, 1);
@@ -384,19 +444,27 @@ static void reserve_page(struct hstate *h, int nid, pid_t pid,
 
 static struct page *__mtat_allocate_page(struct hstate *h, int nid, pid_t pid)
 {
-	struct page *allocated_page = NULL;
+	struct page *page = NULL;
 	struct mtat_page *m_page = NULL;
+	int i;
 
 	lockdep_assert_held(&hugetlb_lock);
 
-	m_page = list_first_entry_or_null(&f_pages[nid], struct mtat_page, list);
+	for (i = 0; i < NR_MEM_TYPES; i++) {
+		spin_lock(&f_pages[i].lock);
+		m_page = list_first_entry_or_null(&f_pages[i].list, struct mtat_page, list);
+		spin_unlock(&f_pages[i].lock);
 
-	if (m_page) {
-		allocated_page = m_page->page;	
-		reserve_page(h, nid, pid, m_page);
+		if (m_page)
+			break;
 	}
 
-	return allocated_page;
+	if (m_page) {
+		page = m_page->page;	
+		reserve_page(h, i, pid, m_page);
+	}
+
+	return page;
 }
 
 static struct page *mtat_allocate_page(struct hstate *h, int nid)
@@ -421,6 +489,179 @@ static struct page *mtat_free_page(struct hstate *h, struct page *page)
 	return page;
 }
 
+/*
+ * Migration daemon
+ */
+static struct task_struct *kmigrated;
+
+static struct page *mtat_alloc_migration_target(struct page *old, unsigned long private)
+{
+	struct hstate *h = page_hstate(old);
+	struct migration_target_control *mtc = (void*)private;
+	struct mtat_page *m_page = NULL;
+	struct page *page = NULL;
+
+	spin_lock(&f_pages[mtc->nid].lock);
+	m_page = list_first_entry_or_null(&f_pages[mtc->nid].list, struct mtat_page, list);
+	spin_unlock(&f_pages[mtc->nid].lock);
+
+	if (m_page) {
+		page = m_page->page;
+		reserve_page(h, mtc->nid, mtc->pid, m_page);
+	}
+
+	return page;
+}
+
+static unsigned int migrate_folio_list(struct list_head *folio_list, int nid, int pid)
+{
+	unsigned int nr_migrated_pages = 0;
+	struct migration_target_control mtc = {
+		.nid = nid,
+		.pid = pid
+	};
+
+	if (list_empty(folio_list))
+		return 0;
+
+	if (migrate_pages(folio_list, mtat_alloc_migration_target,
+				NULL, (unsigned long)&mtc, MIGRATE_SYNC,
+				MR_NUMA_MISPLACED, &nr_migrated_pages))
+		pr_err("migration partially failed.\n");
+
+	return nr_migrated_pages;
+}
+
+static void solorun_migration(void)
+{
+	LIST_HEAD(promote_folios);
+	LIST_HEAD(demote_folios);
+	unsigned int max_demote, nr_free, nr_promote, nr_demote, tmp;
+	struct mtat_page *m_page = NULL;
+
+	pr_info("%s\n", __func__);
+
+	nr_free = get_num_pages(&f_pages[FASTMEM]);
+	max_demote = get_num_pages(&cold_pages[0][FASTMEM]);
+	nr_promote = min(nr_free + max_demote, (unsigned int)get_num_pages(&hot_pages[0][SLOWMEM]));
+	nr_demote = 0;
+
+	tmp = 0;
+	spin_lock(&hot_pages[0][SLOWMEM].lock);
+	list_for_each_entry(m_page, &hot_pages[0][SLOWMEM].list, list) {
+		if (tmp == nr_promote)
+			break;
+
+		if (isolate_hugetlb(m_page->page, &promote_folios))
+			continue;
+		tmp++;
+	}
+	spin_unlock(&hot_pages[0][SLOWMEM].lock);
+
+	if (nr_promote == 0)
+		goto out;
+
+	nr_demote = 0;
+	spin_lock(&cold_pages[0][FASTMEM].lock);
+	list_for_each_entry(m_page, &cold_pages[0][FASTMEM].list, list) {
+		if (nr_demote >= (nr_promote - nr_free))
+			break;
+
+		if (isolate_hugetlb(m_page->page, &demote_folios))
+			continue;
+		nr_demote++;
+	}
+	spin_unlock(&cold_pages[0][FASTMEM].lock);
+
+out:
+
+	pr_info("Expected demoted pages: %u\n", nr_demote);
+	pr_info("Expected promoted pages: %u\n", nr_promote);
+
+	print_num_pages();
+	nr_demote = migrate_folio_list(&demote_folios, SLOWMEM, pids[0]);
+	print_num_pages();
+	nr_promote = migrate_folio_list(&promote_folios, FASTMEM, pids[0]);
+	print_num_pages();
+
+	pr_info("Real demoted pages: %u\n", nr_demote/512);
+	pr_info("Real promoted pages: %u\n", nr_promote/512);
+}
+
+static void corun_migration(void)
+{
+	pr_info("%s\n", __func__);
+}
+
+static void hemem_migration(void)
+{
+	pr_info("%s\n", __func__);
+}
+
+static void test_migration(void)
+{
+	LIST_HEAD(demote_folios);
+	unsigned int max_demote, nr_demote;
+	struct mtat_page *m_page = NULL;
+	struct migration_target_control mtc;
+
+	pr_info("%s\n", __func__);
+
+	max_demote = get_num_pages(&cold_pages[0][FASTMEM]);
+
+	if (max_demote <= 0)
+		return;
+
+	nr_demote = 0;
+	spin_lock(&cold_pages[0][FASTMEM].lock);
+	list_for_each_entry(m_page, &cold_pages[0][FASTMEM].list, list) {
+		if (isolate_hugetlb(m_page->page, &demote_folios))
+			continue;
+		nr_demote++;
+		break;
+	}
+	spin_unlock(&cold_pages[0][FASTMEM].lock);
+
+	pr_info("Expected demoted pages: %u\n", nr_demote);
+	mtc.nid = SLOWMEM;
+	mtc.pid = pids[0];
+	migrate_pages(&demote_folios, mtat_alloc_migration_target,
+				NULL, (unsigned long)&mtc, MIGRATE_SYNC,
+				MR_NUMA_MISPLACED, &nr_demote);
+	pr_info("Real demoted pages: %u\n", nr_demote);
+}
+
+static void do_migration(void)
+{
+	switch(MTAT_MIGRATION_MODE) {
+	case SOLORUN:
+		solorun_migration();
+		break;
+	case CORUN:
+		corun_migration();
+		break;
+	case HEMEM:
+		hemem_migration();
+		break;
+	case TEST_MODE:
+		test_migration();
+		break;
+	}
+}
+
+static int kmigrated_main(void *data)
+{
+	while(!kthread_should_stop()) {
+		do_migration();
+		ssleep(5);
+	}
+
+	return 0;
+}
+
+/*
+ * MTAT initialization
+ */
 int init_module(void)
 {
 	if (init_hashtable())
@@ -438,12 +679,26 @@ int init_module(void)
 		pr_err("Failed to create kmonitord\n");
 	}
 
+	if (!ENABLE_MIGRATION)
+		goto out;
+
+	kmigrated = kthread_run(kmigrated_main, NULL, "kmigrated");
+	if (IS_ERR(kmigrated)) {
+		pr_err("Failed to create kmigrated\n");
+	}
+
+out:
 	pr_info("Successfully insert MTAT module\n");
 	return 0;
 }
 
+/*
+ * MTAT exit
+ */
 void cleanup_module(void)
 {
+	if (ENABLE_MIGRATION)
+		kthread_stop(kmigrated);
 	kthread_stop(kmonitord);
 
 	pebs_stop();
