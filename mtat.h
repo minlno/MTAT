@@ -92,6 +92,7 @@ enum migration_modes {
 #define MTAT_MIGRATION_MODE SOLORUN
 #define WARM_SET_SIZE 0 // 2MB page 갯수
 #define ENABLE_MIGRATION 1
+#define ENABLE_MONITOR 0
 
 struct migration_target_control {
 	int nid;

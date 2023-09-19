@@ -1,6 +1,12 @@
 #include "mtat.h"
 
 /*
+ * Module parameters
+ */
+static int migrate_on = 0;
+module_param(migrate_on, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+
+/*
  * Page list related variables and functions
  *
  * lock 규칙:
@@ -158,7 +164,7 @@ static void print_num_pages(void)
 static int kmonitord_main(void *data)
 {
 	while (!kthread_should_stop()) {
-		//print_num_pages();
+		print_num_pages();
 
 		ssleep(4);
 	}
@@ -176,7 +182,6 @@ static size_t configs[] = { DRAM_READ, PMEM_READ, STORE_ALL };
 // m_page->lock을 잡고 호출해야함.
 static void make_hot_page(struct mtat_page *m_page, int pid_idx, int nid)
 {
-	pr_info("%s\n", __func__);
 	m_page->hotness = HOT;
 	page_list_del(&m_page->list, &cold_pages[pid_idx][nid]);
 	page_list_add(&m_page->list, &hot_pages[pid_idx][nid]);
@@ -185,7 +190,6 @@ static void make_hot_page(struct mtat_page *m_page, int pid_idx, int nid)
 // m_page->lock을 잡고 호출해야함.
 static void make_cold_page(struct mtat_page *m_page, int pid_idx, int nid)
 {
-	pr_info("%s\n", __func__);
 	m_page->hotness = COLD;
 	page_list_del(&m_page->list, &hot_pages[pid_idx][nid]);
 	page_list_add(&m_page->list, &cold_pages[pid_idx][nid]);
@@ -253,12 +257,9 @@ static void pebs_sample(struct perf_event *event,
 			make_cold_page(m_page, pid_idx, nid);
 	}
 
-	pr_info("Before access count: %lld\n", m_page->accesses[access_type]);
 	m_page->accesses[access_type] >>= atomic_read(&global_clock[pid_idx]) - m_page->local_clock;
-	pr_info("After access count: %lld\n", m_page->accesses[access_type]);
 	m_page->local_clock = atomic_read(&global_clock[pid_idx]);
 	if (m_page->accesses[access_type] > COOL_THRESHOLD) {
-		pr_info("cooling\n");
 		atomic_inc(&global_clock[pid_idx]);
 	}
 
@@ -516,6 +517,9 @@ static struct page *mtat_alloc_migration_target(struct page *old, unsigned long 
 static unsigned int migrate_folio_list(struct list_head *folio_list, int nid, int pid)
 {
 	unsigned int nr_migrated_pages = 0;
+	struct page *page;
+	struct page *page2;
+
 	struct migration_target_control mtc = {
 		.nid = nid,
 		.pid = pid
@@ -526,8 +530,12 @@ static unsigned int migrate_folio_list(struct list_head *folio_list, int nid, in
 
 	if (migrate_pages(folio_list, mtat_alloc_migration_target,
 				NULL, (unsigned long)&mtc, MIGRATE_SYNC,
-				MR_NUMA_MISPLACED, &nr_migrated_pages))
+				MR_NUMA_MISPLACED, &nr_migrated_pages)) {
 		pr_err("migration partially failed.\n");
+		list_for_each_entry_safe(page, page2, folio_list, lru) {
+			putback_active_hugepage(page);
+		}
+	}
 
 	return nr_migrated_pages;
 }
@@ -578,11 +586,8 @@ out:
 	pr_info("Expected demoted pages: %u\n", nr_demote);
 	pr_info("Expected promoted pages: %u\n", nr_promote);
 
-	print_num_pages();
 	nr_demote = migrate_folio_list(&demote_folios, SLOWMEM, pids[0]);
-	print_num_pages();
 	nr_promote = migrate_folio_list(&promote_folios, FASTMEM, pids[0]);
-	print_num_pages();
 
 	pr_info("Real demoted pages: %u\n", nr_demote/512);
 	pr_info("Real promoted pages: %u\n", nr_promote/512);
@@ -628,7 +633,7 @@ static void test_migration(void)
 	migrate_pages(&demote_folios, mtat_alloc_migration_target,
 				NULL, (unsigned long)&mtc, MIGRATE_SYNC,
 				MR_NUMA_MISPLACED, &nr_demote);
-	pr_info("Real demoted pages: %u\n", nr_demote);
+	pr_info("Real demoted pages: %u\n", nr_demote/512);
 }
 
 static void do_migration(void)
@@ -652,7 +657,9 @@ static void do_migration(void)
 static int kmigrated_main(void *data)
 {
 	while(!kthread_should_stop()) {
-		do_migration();
+		print_num_pages();
+		if (migrate_on)
+			do_migration();
 		ssleep(5);
 	}
 
@@ -674,11 +681,15 @@ int init_module(void)
 
 	pebs_start();
 
+	if (!ENABLE_MONITOR)
+		goto kmigrated_label;
+
 	kmonitord = kthread_run(kmonitord_main, NULL, "kmonitord");
 	if (IS_ERR(kmonitord)) {
 		pr_err("Failed to create kmonitord\n");
 	}
 
+kmigrated_label:
 	if (!ENABLE_MIGRATION)
 		goto out;
 
@@ -699,7 +710,8 @@ void cleanup_module(void)
 {
 	if (ENABLE_MIGRATION)
 		kthread_stop(kmigrated);
-	kthread_stop(kmonitord);
+	if (ENABLE_MONITOR)
+		kthread_stop(kmonitord);
 
 	pebs_stop();
 
