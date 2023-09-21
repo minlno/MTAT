@@ -224,7 +224,7 @@ static void pebs_sample(struct perf_event *event,
 		struct perf_sample_data *data, struct pt_regs *regs)
 {
 	uint64_t pfn;
-	int nid, pid, pid_idx;
+	int nid, pid_idx;
 	bool write = event->attr.config == STORE_ALL;
 	int access_type = write ? WRITE_MTAT : READ_MTAT;
 	struct mtat_page *m_page = NULL;
@@ -694,7 +694,30 @@ static void corun_migration(void)
 
 static void hemem_migration(void)
 {
+	LIST_HEAD(promote_pages);
+	LIST_HEAD(demote_pages);
+	int nr_fmem_free, nr_fmem_cold;
+	int target_promote, target_demote; 
+	int nr_promote, nr_demote;
+
 	pr_info("%s\n", __func__);
+
+	nr_fmem_free = get_num_pages(&f_pages[FASTMEM]);
+	nr_fmem_cold = get_num_pages(&cold_pages[0][FASTMEM]);
+	target_promote = min(nr_fmem_free + nr_fmem_cold, get_num_pages(&hot_pages[0][SLOWMEM]));
+	target_demote = max(0, target_promote - nr_fmem_free);
+
+	nr_promote = isolate_mtat_pages(&hot_pages[0][SLOWMEM], &promote_pages, target_promote);
+	nr_demote = isolate_mtat_pages(&cold_pages[0][FASTMEM], &demote_pages, target_demote);
+
+	pr_info("Expected demoted pages: %u\n", nr_demote);
+	pr_info("Expected promoted pages: %u\n", nr_promote);
+
+	nr_demote = migrate_page_list(&demote_pages, SLOWMEM, pids[0]);
+	nr_promote = migrate_page_list(&promote_pages, FASTMEM, pids[0]);
+
+	pr_info("Real demoted pages: %u\n", nr_demote/512);
+	pr_info("Real promoted pages: %u\n", nr_promote/512);
 }
 
 static void test_migration(void)
