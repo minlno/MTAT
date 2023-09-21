@@ -240,8 +240,6 @@ static void pebs_sample(struct perf_event *event,
 
 	pid_idx = m_page->pids_idx;
 	nid = m_page->nid;
-	pid = pids[pid_idx]; // pids[i]는 한번 쓰이면 값이 변하지 않음. lock잡을 필요 X
-
 
 	m_page->accesses[access_type]++;
 
@@ -409,6 +407,11 @@ static void reserve_page(struct hstate *h, int nid, pid_t pid,
 {
 	int i;
 
+	if (MTAT_MIGRATION_MODE == HEMEM) {
+		i = 0;
+		goto m_page_init;
+	}
+
 	spin_lock(&lock);
 	for (i = 0; i < MAX_PIDS; i++) {
 		if (pids[i] == PID_NONE || pids[i] == pid)
@@ -423,6 +426,7 @@ static void reserve_page(struct hstate *h, int nid, pid_t pid,
 		pids[i] = pid;
 	spin_unlock(&lock);
 
+m_page_init:
 	spin_lock(&m_page->lock);
 
 	m_page->local_clock = atomic_read(&global_clock[i]);
@@ -514,7 +518,7 @@ static struct page *mtat_alloc_migration_target(struct page *old, unsigned long 
 	return page;
 }
 
-static unsigned int migrate_folio_list(struct list_head *folio_list, int nid, int pid)
+static unsigned int migrate_page_list(struct list_head *page_list, int nid, int pid)
 {
 	unsigned int nr_migrated_pages = 0;
 	struct page *page;
@@ -525,14 +529,14 @@ static unsigned int migrate_folio_list(struct list_head *folio_list, int nid, in
 		.pid = pid
 	};
 
-	if (list_empty(folio_list))
+	if (list_empty(page_list))
 		return 0;
 
-	if (migrate_pages(folio_list, mtat_alloc_migration_target,
+	if (migrate_pages(page_list, mtat_alloc_migration_target,
 				NULL, (unsigned long)&mtc, MIGRATE_SYNC,
 				MR_NUMA_MISPLACED, &nr_migrated_pages)) {
 		pr_err("migration partially failed.\n");
-		list_for_each_entry_safe(page, page2, folio_list, lru) {
+		list_for_each_entry_safe(page, page2, page_list, lru) {
 			putback_active_hugepage(page);
 		}
 	}
@@ -540,62 +544,152 @@ static unsigned int migrate_folio_list(struct list_head *folio_list, int nid, in
 	return nr_migrated_pages;
 }
 
+static unsigned int isolate_mtat_pages(struct page_list *from, 
+		struct list_head *to, int target_nr)
+{
+	struct mtat_page *m_page = NULL;
+	int nr = 0;
+
+	spin_lock(&from->lock);
+	list_for_each_entry(m_page, &from->list, list) {
+		if (nr >= target_nr)
+			break;
+		if (isolate_hugetlb(m_page->page, to))
+			continue;
+		nr++;
+	}
+	spin_unlock(&from->lock);
+
+	return nr;
+}
+
 static void solorun_migration(void)
 {
-	LIST_HEAD(promote_folios);
-	LIST_HEAD(demote_folios);
-	unsigned int max_demote, nr_free, nr_promote, nr_demote, tmp;
-	struct mtat_page *m_page = NULL;
+	LIST_HEAD(promote_pages);
+	LIST_HEAD(demote_pages);
+	int nr_fmem_free, nr_fmem_cold;
+	int target_promote, target_demote; 
+	int nr_promote, nr_demote;
 
 	pr_info("%s\n", __func__);
 
-	nr_free = get_num_pages(&f_pages[FASTMEM]);
-	max_demote = get_num_pages(&cold_pages[0][FASTMEM]);
-	nr_promote = min(nr_free + max_demote, (unsigned int)get_num_pages(&hot_pages[0][SLOWMEM]));
-	nr_demote = 0;
+	nr_fmem_free = get_num_pages(&f_pages[FASTMEM]);
+	nr_fmem_cold = get_num_pages(&cold_pages[0][FASTMEM]);
+	target_promote = min(nr_fmem_free + nr_fmem_cold, get_num_pages(&hot_pages[0][SLOWMEM]));
+	target_demote = max(0, target_promote - nr_fmem_free);
+	if (WARM_SET_SIZE >= 0 && 
+		nr_fmem_cold - target_demote > WARM_SET_SIZE)
+		target_demote = nr_fmem_cold - WARM_SET_SIZE;
 
-	tmp = 0;
-	spin_lock(&hot_pages[0][SLOWMEM].lock);
-	list_for_each_entry(m_page, &hot_pages[0][SLOWMEM].list, list) {
-		if (tmp == nr_promote)
-			break;
-
-		if (isolate_hugetlb(m_page->page, &promote_folios))
-			continue;
-		tmp++;
-	}
-	spin_unlock(&hot_pages[0][SLOWMEM].lock);
-
-	if (nr_promote == 0)
-		goto out;
-
-	nr_demote = 0;
-	spin_lock(&cold_pages[0][FASTMEM].lock);
-	list_for_each_entry(m_page, &cold_pages[0][FASTMEM].list, list) {
-		if (nr_demote >= (nr_promote - nr_free))
-			break;
-
-		if (isolate_hugetlb(m_page->page, &demote_folios))
-			continue;
-		nr_demote++;
-	}
-	spin_unlock(&cold_pages[0][FASTMEM].lock);
-
-out:
+	nr_promote = isolate_mtat_pages(&hot_pages[0][SLOWMEM], &promote_pages, target_promote);
+	nr_demote = isolate_mtat_pages(&cold_pages[0][FASTMEM], &demote_pages, target_demote);
 
 	pr_info("Expected demoted pages: %u\n", nr_demote);
 	pr_info("Expected promoted pages: %u\n", nr_promote);
 
-	nr_demote = migrate_folio_list(&demote_folios, SLOWMEM, pids[0]);
-	nr_promote = migrate_folio_list(&promote_folios, FASTMEM, pids[0]);
+	nr_demote = migrate_page_list(&demote_pages, SLOWMEM, pids[0]);
+	nr_promote = migrate_page_list(&promote_pages, FASTMEM, pids[0]);
 
 	pr_info("Real demoted pages: %u\n", nr_demote/512);
 	pr_info("Real promoted pages: %u\n", nr_promote/512);
 }
 
+/*
+ * LC: pids[0], BE: pids[1]
+ * LC hot page는 모두 FMEM에 이주
+ * LC FMEM cold page는 warm set size 만큼만 남기고 나머지 다 SMEM에 이주
+ * FMEM이 남으면 BE의 SMEM page들을 FMEM에 이주 (hot page를 우선적으로)
+ */
 static void corun_migration(void)
 {
+	struct list_head promote_pages[2]; // [lc/be]
+	struct list_head demote_pages[2]; // [lc/be]
+	const int lc = 0, be = 1;
+	int nr_fmem_free;
+	int nr_fmem_hot[2], nr_fmem_cold[2]; // [lc/be]
+	int nr_smem_hot[2], nr_smem_cold[2]; // [lc/be]
+	int target_promote[2][2], target_demote[2][2]; // [lc/be][HOT/COLD]
+	int nr_promote[2], nr_demote[2]; // [lc/be]
+	int i, j;
 	pr_info("%s\n", __func__);
+
+	for (i = 0; i < 2; i++) {
+		for (j = 0; j < 2; j++) {
+			target_promote[i][j] = 0;
+			target_demote[i][j] = 0;
+		}
+		INIT_LIST_HEAD(&promote_pages[i]);
+		INIT_LIST_HEAD(&demote_pages[i]);
+	}
+
+	nr_fmem_free = get_num_pages(&f_pages[FASTMEM]);
+	for (i = 0; i < 2; i++) {
+		nr_fmem_hot[i] = get_num_pages(&hot_pages[i][FASTMEM]);
+		nr_fmem_cold[i] = get_num_pages(&cold_pages[i][FASTMEM]);
+		nr_smem_hot[i] = get_num_pages(&hot_pages[i][SLOWMEM]);
+		nr_smem_cold[i] = get_num_pages(&cold_pages[i][SLOWMEM]);
+	}
+
+	/* Calculate target_promote, target_demote size for LC */
+	target_promote[lc][HOT] = min(nr_fmem_free + nr_fmem_cold[lc] + nr_fmem_cold[be],
+				get_num_pages(&hot_pages[lc][SLOWMEM]));
+	target_demote[lc][COLD] = max(0, target_promote[lc][HOT] - nr_fmem_free - nr_fmem_cold[be]);
+	if (WARM_SET_SIZE >= 0) {
+		int lc_remain_cold = nr_fmem_cold[lc] - target_demote[lc][COLD];
+		if (lc_remain_cold > WARM_SET_SIZE) {
+			target_demote[lc][COLD] = nr_fmem_cold[lc] - WARM_SET_SIZE;
+		} else if (lc_remain_cold < WARM_SET_SIZE) {
+			int leftover = WARM_SET_SIZE - lc_remain_cold;
+			if (leftover <= target_demote[lc][COLD])
+				target_demote[lc][COLD] -= leftover;
+			else {
+				target_promote[lc][COLD] = target_demote[lc][COLD] + leftover;
+				target_demote[lc][COLD] = 0;
+			}
+		}
+	}
+
+	/* Calculate target_promote, target_demote size for BE */
+	int be_fmem_size = nr_fmem_free + nr_fmem_hot[be] + nr_fmem_cold[be];
+	int fmem_for_be = be_fmem_size - target_promote[lc][HOT] 
+		- target_promote[lc][COLD] + target_demote[lc][COLD];
+	if (be_fmem_size > fmem_for_be) {
+		int leftover = be_fmem_size - fmem_for_be;
+		target_demote[be][COLD] = min(leftover, nr_fmem_cold[be]);
+		target_promote[be][HOT] = max(0, leftover - target_demote[be][COLD]);
+	} else if (be_fmem_size < fmem_for_be) {
+		int leftover = fmem_for_be - be_fmem_size;
+		target_promote[be][HOT] = min(leftover, nr_smem_hot[be]);
+		target_promote[be][COLD] = max(0, leftover - target_promote[be][HOT]);
+	}
+
+	/* Isolate pages for migration */
+	for (i = 0; i < 2; i++) {
+		nr_promote[i] = isolate_mtat_pages(&hot_pages[i][SLOWMEM], 
+					&promote_pages[i], target_promote[i][HOT]);
+		nr_promote[i] += isolate_mtat_pages(&cold_pages[i][SLOWMEM], 
+					&promote_pages[i], target_promote[i][COLD]);
+		nr_demote[i] = isolate_mtat_pages(&hot_pages[i][FASTMEM], 
+					&demote_pages[i], target_demote[i][HOT]);
+		nr_demote[i] += isolate_mtat_pages(&cold_pages[i][FASTMEM], 
+					&demote_pages[i], target_demote[i][COLD]);
+	}
+
+	/* Do Migration */
+	pr_info("LC - Expected demoted pages: %u\n", nr_demote[lc]);
+	pr_info("LC - Expected promoted pages: %u\n", nr_promote[lc]);
+	pr_info("BE - Expected demoted pages: %u\n", nr_demote[be]);
+	pr_info("BE - Expected promoted pages: %u\n", nr_promote[be]);
+
+	nr_demote[be] = migrate_page_list(&demote_pages[be], SLOWMEM, pids[be]);
+	nr_demote[lc] = migrate_page_list(&demote_pages[lc], SLOWMEM, pids[lc]);
+	nr_promote[lc] = migrate_page_list(&promote_pages[lc], FASTMEM, pids[lc]);
+	nr_promote[be] = migrate_page_list(&promote_pages[be], FASTMEM, pids[be]);
+
+	pr_info("LC - Real demoted pages: %u\n", nr_demote[lc]/512);
+	pr_info("LC - Real promoted pages: %u\n", nr_promote[lc]/512);
+	pr_info("BE - Real demoted pages: %u\n", nr_demote[be]/512);
+	pr_info("BE - Real promoted pages: %u\n", nr_promote[be]/512);
 }
 
 static void hemem_migration(void)
@@ -605,35 +699,44 @@ static void hemem_migration(void)
 
 static void test_migration(void)
 {
-	LIST_HEAD(demote_folios);
-	unsigned int max_demote, nr_demote;
+	LIST_HEAD(folio_list);
+	unsigned int nr_pages;
 	struct mtat_page *m_page = NULL;
 	struct migration_target_control mtc;
+	int nid;
 
 	pr_info("%s\n", __func__);
 
-	max_demote = get_num_pages(&cold_pages[0][FASTMEM]);
-
-	if (max_demote <= 0)
-		return;
-
-	nr_demote = 0;
+	nid = SLOWMEM;
+	nr_pages = 0;
 	spin_lock(&cold_pages[0][FASTMEM].lock);
 	list_for_each_entry(m_page, &cold_pages[0][FASTMEM].list, list) {
-		if (isolate_hugetlb(m_page->page, &demote_folios))
+		if (isolate_hugetlb(m_page->page, &folio_list))
 			continue;
-		nr_demote++;
-		break;
+		nr_pages++;
 	}
 	spin_unlock(&cold_pages[0][FASTMEM].lock);
 
-	pr_info("Expected demoted pages: %u\n", nr_demote);
-	mtc.nid = SLOWMEM;
+	if (nr_pages > 0)
+		goto migrate;
+
+	nid = FASTMEM;
+	spin_lock(&cold_pages[0][SLOWMEM].lock);
+	list_for_each_entry(m_page, &cold_pages[0][SLOWMEM].list, list) {
+		if (isolate_hugetlb(m_page->page, &folio_list))
+			continue;
+		nr_pages++;
+	}
+	spin_unlock(&cold_pages[0][SLOWMEM].lock);
+
+migrate:
+	pr_info("Expected migrated pages: %u\n", nr_pages);
+	mtc.nid = nid;
 	mtc.pid = pids[0];
-	migrate_pages(&demote_folios, mtat_alloc_migration_target,
+	migrate_pages(&folio_list, mtat_alloc_migration_target,
 				NULL, (unsigned long)&mtc, MIGRATE_SYNC,
-				MR_NUMA_MISPLACED, &nr_demote);
-	pr_info("Real demoted pages: %u\n", nr_demote/512);
+				MR_NUMA_MISPLACED, &nr_pages);
+	pr_info("Real migrated pages: %u\n", nr_pages/512);
 }
 
 static void do_migration(void)
