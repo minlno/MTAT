@@ -59,13 +59,17 @@ struct mtat_page *alloc_and_init_mtat_page(struct page *page);
 struct page_list {
 	struct list_head list;
 	int num_pages;
+	bool need_cooling;
+	struct mtat_page *curr_cool_page;
 	spinlock_t lock;
 };
 
-int get_num_pages(struct page_list *pl); // TODO
-void page_list_del(struct list_head *page, struct page_list *list); // TODO, num_page 카운팅도 수행.
-void page_list_add(struct list_head *page, struct page_list *list); // TODO, num_page 카운팅도 수행.
-void init_page_list(struct page_list *list); //TODO
+int get_num_pages(struct page_list *pl); 
+bool need_cooling(struct page_list *pl);
+void set_need_cooling(struct page_list *pl, bool cool);
+void page_list_del(struct mtat_page *m_page, struct page_list *list); // num_page 카운팅도 수행.
+void page_list_add(struct mtat_page *m_page, struct page_list *list); // num_page 카운팅도 수행.
+void init_page_list(struct page_list *list);
 
 
 /*
@@ -74,6 +78,7 @@ void init_page_list(struct page_list *list); //TODO
 #define HOT_READ_THRESHOLD 8
 #define HOT_WRITE_THRESHOLD 4
 #define COOL_THRESHOLD 18
+#define COOL_PAGES 8192
 #define PMEM_READ 0x80d1
 #define DRAM_READ 0x01d3
 #define STORE_ALL 0x82d0
@@ -90,8 +95,8 @@ enum migration_modes {
 };
 
 //#define MTAT_MIGRATION_MODE SOLORUN
-#define MTAT_MIGRATION_MODE CORUN
-//#define MTAT_MIGRATION_MODE HEMEM
+//#define MTAT_MIGRATION_MODE CORUN
+#define MTAT_MIGRATION_MODE HEMEM
 //#define MTAT_MIGRATION_MODE TEST_MODE
 #define WARM_SET_SIZE 50 // 2MB page 갯수
 #define ENABLE_MIGRATION 1
