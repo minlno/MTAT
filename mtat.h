@@ -75,6 +75,12 @@ void init_page_list(struct page_list *list);
 /*
  * PEBS sampling
  */
+struct perf_sample {
+	struct perf_event_header header;
+	u64 ip;
+	u32 pid, tid;
+	u64 phys_addr;
+};
 #define HOT_READ_THRESHOLD 8
 #define HOT_WRITE_THRESHOLD 4
 #define COOL_THRESHOLD 18

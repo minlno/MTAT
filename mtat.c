@@ -1,4 +1,5 @@
 #include "mtat.h"
+#include "internal.h"
 
 /*
  * Module parameters
@@ -134,7 +135,9 @@ static int pid_to_idx(int pid)
 }
 
 /*
- * Hashtable for MTAT page management
+ ****************************************
+ *  Hashtable for MTAT page management  *
+ ****************************************
  */
 static struct rhashtable *hashtable = NULL;
 static struct rhashtable_params params = {
@@ -177,8 +180,10 @@ static void destroy_hashtable(void)
 		rhashtable_free_and_destroy(hashtable, rh_free_fn, NULL);
 }
 
-/*
- * kmonitord thread for debugging
+/* 
+ **********************************
+ * kmonitord thread for debugging *
+ **********************************
  */
 static struct task_struct *kmonitord;
 
@@ -213,10 +218,102 @@ static int kmonitord_main(void *data)
 
 
 /*
- * PEBS related variables and functions
+ ****************************************
+ * PEBS related variables and functions *
+ ****************************************
  */
 static struct perf_event **events;
 static size_t configs[] = { DRAM_READ, PMEM_READ, STORE_ALL };
+static struct task_struct *kpebsd;
+
+static __always_inline enum perf_event_state
+__perf_effective_state(struct perf_event *event)
+{
+	struct perf_event *leader = event->group_leader;
+
+	if (leader->state <= PERF_EVENT_STATE_OFF)
+		return leader->state;
+
+	return event->state;
+}
+
+static __always_inline void
+__perf_update_times(struct perf_event *event, u64 now, u64 *enabled, u64 *running)
+{
+	enum perf_event_state state = __perf_effective_state(event);
+	u64 delta = now - event->tstamp;
+
+	*enabled = event->total_time_enabled;
+	if (state >= PERF_EVENT_STATE_INACTIVE)
+		*enabled += delta;
+
+	*running = event->total_time_running;
+	if (state >= PERF_EVENT_STATE_ACTIVE)
+		*running += delta;
+}
+
+static void perf_event_init_userpage(struct perf_event *event)
+{
+	struct perf_event_mmap_page *userpg;
+	struct perf_buffer *rb;
+
+	rcu_read_lock();
+	rb = rcu_dereference(event->rb);
+	if (!rb)
+		goto unlock;
+
+	userpg = rb->user_page;
+
+	/* Allow new userspace to detect that bit 0 is deprecated */
+	userpg->cap_bit0_is_deprecated = 1;
+	userpg->size = offsetof(struct perf_event_mmap_page, __reserved);
+	userpg->data_offset = PAGE_SIZE;
+	userpg->data_size = perf_data_size(rb);
+
+unlock:
+	rcu_read_unlock();
+}
+
+static void init_perf_buffer(struct perf_event *pe)
+{
+	struct perf_buffer *rb = NULL;
+	unsigned long nr_pages = 1UL << 14;
+	unsigned long flags;
+	u64 now;
+
+	rb = rb_alloc(nr_pages, 0, pe->cpu, 0);
+	if (!rb)
+		pr_err("Failed to allocate perf_buffer\n");
+
+	/* ring_buffer_attach() */
+	if (pe->rcu_pending) {
+		cond_synchronize_rcu(pe->rcu_batches);
+		pe->rcu_pending = 0;
+	}
+
+	spin_lock_irqsave(&rb->event_lock, flags);
+	list_add_rcu(&pe->rb_entry, &rb->event_list);
+	spin_unlock_irqrestore(&rb->event_lock, flags);
+
+	//if (has_aux(pe))
+	//	perf_event_stop(pe, 0);
+
+	rcu_assign_pointer(pe->rb, rb);
+
+	/* perf_event_update_time() */
+	if (!pe->ctx) {
+		now = 0;
+		pr_err("event->ctx is NULL\n");
+	} else {
+		now = pe->ctx->time;
+	}
+	__perf_update_times(pe, now, &pe->total_time_enabled,
+			&pe->total_time_running);
+	pe->tstamp = now;
+
+	perf_event_init_userpage(pe);
+	perf_event_update_userpage(pe);
+}
 
 // m_page->lock을 잡고 호출해야함.
 static void make_hot_page(struct mtat_page *m_page, int pid_idx, int nid)
@@ -325,21 +422,15 @@ static uint64_t perf_virt_to_phys(u64 virt)
 	return phys_addr;
 }
 
-static void pebs_sample(struct perf_event *event, 
-		struct perf_sample_data *data, struct pt_regs *regs)
+static void pebs_sample(uint64_t pfn, int access_type) 
 {
-	uint64_t pfn;
 	int nid, pid_idx;
-	bool write = event->attr.config == STORE_ALL;
-	int access_type = write ? WRITE_MTAT : READ_MTAT;
 	struct mtat_page *m_page = NULL;
 
-	pfn = perf_virt_to_phys(data->addr) >> HPAGE_SHIFT;
 	m_page = rhashtable_lookup_fast(hashtable, &pfn, params);
 	if (!m_page) {
 		return;
 	}
-
 	
 	spin_lock(&m_page->lock);
 
@@ -367,28 +458,84 @@ static void pebs_sample(struct perf_event *event,
 		set_need_cooling(&hot_pages[pid_idx][FASTMEM], true);
 		set_need_cooling(&hot_pages[pid_idx][SLOWMEM], true);
 	}
-
-
 	
 	spin_unlock(&m_page->lock);
 }
 
+static int kpebsd_main(void *data)
+{
+	struct perf_buffer *pe_rb;
+	struct perf_event_mmap_page *p;
+	struct perf_event_header *ph;
+	struct perf_sample *ps;
+	char *pbuf;
+	size_t idx, config, cpu, ncpus = num_online_cpus();
+	int access_type;
+	uint64_t pfn;
+
+	pr_info("kpebsd start\n");
+	while (!kthread_should_stop()) {
+		for (config = 0; config < ARRAY_SIZE(configs); config++) {
+			for (cpu = 0; cpu < ncpus; cpu++) {
+				idx = config * ncpus + cpu;
+				pe_rb = events[idx]->rb;
+				if (!pe_rb) {
+					pr_info("CPU%lu: rb is NULL\n", cpu);
+					continue;
+				}
+				p = pe_rb->user_page;
+				pbuf = (char *)p + p->data_offset;
+
+				smp_rmb();
+
+				if (p->data_head == p->data_tail)
+					continue;
+
+				ph = (void *)(pbuf + (p->data_tail % p->data_size));
+
+				switch (ph->type) {
+				case PERF_RECORD_SAMPLE:
+					ps = (struct perf_sample *)ph;
+					if (!ps) {
+						pr_err("ps is NULL\n");
+						continue;
+					}
+
+					//pfn = perf_virt_to_phys(ps->addr) >> HPAGE_SHIFT;
+					pfn = ps->phys_addr >> HPAGE_SHIFT;
+					access_type = configs[config] == STORE_ALL ? WRITE_MTAT : READ_MTAT;
+					pebs_sample(pfn, access_type);
+					break;
+				}
+				p->data_tail += ph->size;
+			}
+		}
+
+		if (need_resched())
+			schedule();
+	}
+
+	pr_info("kpebsd exit\n");
+	return 0;
+}
+
 static void pebs_start(void)
 {
-	size_t config, cpu, ncpus = num_online_cpus();
+	size_t idx, config, cpu, ncpus = num_online_cpus();
 	static struct perf_event_attr wd_hw_attr = {
 		.type = PERF_TYPE_RAW,
 		.size = sizeof(struct perf_event_attr),
-		.pinned = 0,
-		.disabled = 1,
+		//.pinned = 0,
+		.disabled = 0,
 		.precise_ip = 2,
 		.sample_id_all = 1,
 		.exclude_kernel = 1,
 		.exclude_guest = 1,
 		.exclude_hv = 1,
+		.exclude_callchain_kernel = 1,
+		.exclude_callchain_user = 1,
 		.exclude_user = 0,
-		.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID |
-			       PERF_SAMPLE_WEIGHT | PERF_SAMPLE_ADDR | PERF_SAMPLE_PHYS_ADDR,
+		.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PHYS_ADDR,
 	};
 
 	events = vmalloc(ncpus * ARRAY_SIZE(configs) * sizeof(*events));
@@ -399,28 +546,37 @@ static void pebs_start(void)
 
 	for (config = 0; config < ARRAY_SIZE(configs); config++) {
 		for (cpu = 0; cpu < ncpus; cpu++) {
-			size_t idx = config * ncpus + cpu;
+			idx = config * ncpus + cpu;
 			wd_hw_attr.config = configs[config];
 			wd_hw_attr.sample_period = SAMPLE_PERIOD_PEBS;
 			events[idx] = 
 				perf_event_create_kernel_counter(&wd_hw_attr,
-						cpu, NULL, pebs_sample, NULL);
+						cpu, NULL, NULL, NULL);
 			if (IS_ERR(events[idx])) {
 				pr_err("Failed to create event %lu on cpu %lu\n", configs[config], cpu);
 				return;
 			}
+			init_perf_buffer(events[idx]);
 			perf_event_enable(events[idx]);
 		}
 	}
+
+	kpebsd = kthread_run(kpebsd_main, NULL, "kpebsd");
+	if (IS_ERR(kpebsd))
+		pr_err("Failed to create kpebsd\n");
 }
 static void pebs_stop(void)
 {
-	size_t config, cpu, ncpus = num_online_cpus();
+	size_t idx, config, cpu, ncpus = num_online_cpus();
+
+	if (kpebsd)
+		kthread_stop(kpebsd);
 
 	for (config = 0; config < ARRAY_SIZE(configs); config++) {
 		for (cpu = 0; cpu < ncpus; cpu++) {
-			size_t idx = config * ncpus + cpu;
+			idx = config * ncpus + cpu;
 			perf_event_disable(events[idx]);
+			ring_buffer_put(events[idx]->rb);
 			perf_event_release_kernel(events[idx]);
 		}
 	}
@@ -896,7 +1052,7 @@ static int kmigrated_main(void *data)
 		partial_cooling();
 		ssleep(5);
 	}
-
+	pr_info("kmigrated exit\n");
 	return 0;
 }
 
