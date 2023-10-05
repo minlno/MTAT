@@ -6,6 +6,12 @@
  */
 static int migrate_on = 0;
 module_param(migrate_on, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+static int hot_read_threshold = 8;
+module_param(hot_read_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+static int hot_write_threshold = 4;
+module_param(hot_write_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+static int cool_threshold = 18;
+module_param(cool_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 
 /*
  * Util funtions
@@ -339,8 +345,8 @@ static void init_perf_buffer(struct perf_event *pe)
 // m_page->lock을 잡고 호출해야함.
 static bool is_hot_page(struct mtat_page *m_page)
 {
-	if (m_page->accesses[WRITE_MTAT] >= HOT_WRITE_THRESHOLD
-	  || m_page->accesses[READ_MTAT] >= HOT_READ_THRESHOLD) 
+	if (m_page->accesses[WRITE_MTAT] >= hot_write_threshold
+	  || m_page->accesses[READ_MTAT] >= hot_read_threshold) 
 		return true;
 	else 
 		return false;
@@ -479,7 +485,7 @@ static void pebs_sample(uint64_t pfn, int access_type)
 			make_cold_page(m_page, pid_idx, nid);
 	}
 		
-	if (m_page->accesses[access_type] > COOL_THRESHOLD) {
+	if (m_page->accesses[access_type] > cool_threshold) {
 		atomic_inc(&global_clock[pid_idx]);
 		set_need_cooling(&hot_pages[pid_idx][FASTMEM], true);
 		set_need_cooling(&hot_pages[pid_idx][SLOWMEM], true);
@@ -796,8 +802,8 @@ static void sync_mtat_page_after_migration(struct migration_target_control *mtc,
 	spin_lock(&m_page->lock);
 	
 	if (mtc->hotness == HOT) {
-		m_page->accesses[READ_MTAT] = HOT_READ_THRESHOLD;
-		m_page->accesses[WRITE_MTAT] = HOT_WRITE_THRESHOLD;
+		m_page->accesses[READ_MTAT] = hot_read_threshold;
+		m_page->accesses[WRITE_MTAT] = hot_write_threshold;
 		make_hot_page(m_page, m_page->pids_idx, m_page->nid);
 	}
 

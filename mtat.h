@@ -82,9 +82,6 @@ struct perf_sample {
 	u32 pid, tid;
 	u64 phys_addr;
 };
-#define HOT_READ_THRESHOLD 8
-#define HOT_WRITE_THRESHOLD 4
-#define COOL_THRESHOLD 18
 #define COOL_PAGES 8192
 #define PMEM_READ 0x80d1
 #define DRAM_READ 0x01d3
