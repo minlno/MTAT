@@ -111,6 +111,7 @@ enum migration_modes {
 struct migration_target_control {
 	int nid;
 	int pid;
+	int hotness;
 };
 
 #endif /* __MTAT__ */

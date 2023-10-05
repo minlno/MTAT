@@ -316,6 +316,16 @@ static void init_perf_buffer(struct perf_event *pe)
 }
 
 // m_page->lock을 잡고 호출해야함.
+static bool is_hot_page(struct mtat_page *m_page)
+{
+	if (m_page->accesses[WRITE_MTAT] >= HOT_WRITE_THRESHOLD
+	  || m_page->accesses[READ_MTAT] >= HOT_READ_THRESHOLD) 
+		return true;
+	else 
+		return false;
+}
+
+// m_page->lock을 잡고 호출해야함.
 static void make_hot_page(struct mtat_page *m_page, int pid_idx, int nid)
 {
 	m_page->hotness = HOT;
@@ -365,8 +375,7 @@ static void partial_cooling_pid(int pid_idx)
 					atomic_read(&global_clock[pid_idx]) - m_page->local_clock;
 			m_page->local_clock = atomic_read(&global_clock[pid_idx]);
 
-			if (m_page->accesses[WRITE_MTAT] < HOT_WRITE_THRESHOLD &&
-				m_page->accesses[READ_MTAT] < HOT_READ_THRESHOLD) {
+			if (!is_hot_page(m_page)) {
 				nr_cooled++;
 				make_cold_page(m_page, pid_idx, nid);
 			}
@@ -441,14 +450,10 @@ static void pebs_sample(uint64_t pfn, int access_type)
 	m_page->local_clock = atomic_read(&global_clock[pid_idx]);
 
 	m_page->accesses[access_type]++;
-	if (m_page->accesses[WRITE_MTAT] >= HOT_WRITE_THRESHOLD) {
+	if (is_hot_page(m_page)) {
 		if (m_page->hotness != HOT)
 			make_hot_page(m_page, pid_idx, nid);
-	} else if (m_page->accesses[READ_MTAT] >= HOT_READ_THRESHOLD) {
-		if (m_page->hotness != HOT)
-			make_hot_page(m_page, pid_idx, nid);
-	} else if (m_page->accesses[WRITE_MTAT] < HOT_WRITE_THRESHOLD &&
-			m_page->accesses[READ_MTAT] < HOT_READ_THRESHOLD) {
+	} else {
 		if (m_page->hotness != COLD)
 			make_cold_page(m_page, pid_idx, nid);
 	}
@@ -761,6 +766,20 @@ static struct page *mtat_free_page(struct hstate *h, struct page *page)
  */
 static struct task_struct *kmigrated;
 
+static void sync_mtat_page_after_migration(struct migration_target_control *mtc,
+		struct mtat_page *m_page)
+{
+	spin_lock(&m_page->lock);
+	
+	if (mtc->hotness == HOT) {
+		m_page->accesses[READ_MTAT] = HOT_READ_THRESHOLD;
+		m_page->accesses[WRITE_MTAT] = HOT_WRITE_THRESHOLD;
+		make_hot_page(m_page, m_page->pids_idx, m_page->nid);
+	}
+
+	spin_unlock(&m_page->lock);
+}
+
 static struct page *mtat_alloc_migration_target(struct page *old, unsigned long private)
 {
 	struct hstate *h = page_hstate(old);
@@ -775,12 +794,13 @@ static struct page *mtat_alloc_migration_target(struct page *old, unsigned long 
 	if (m_page) {
 		page = m_page->page;
 		reserve_page(h, mtc->nid, mtc->pid, m_page);
+		sync_mtat_page_after_migration(mtc, m_page);
 	}
 
 	return page;
 }
 
-static unsigned int migrate_page_list(struct list_head *page_list, int nid, int pid)
+static unsigned int migrate_page_list(struct list_head *page_list, int nid, int pid, int hotness)
 {
 	unsigned int nr_migrated_pages = 0;
 	struct page *page;
@@ -788,7 +808,8 @@ static unsigned int migrate_page_list(struct list_head *page_list, int nid, int 
 
 	struct migration_target_control mtc = {
 		.nid = nid,
-		.pid = pid
+		.pid = pid,
+		.hotness = hotness
 	};
 
 	if (list_empty(page_list))
@@ -849,8 +870,8 @@ static void solorun_migration(void)
 	pr_info("Expected demoted pages: %u\n", nr_demote);
 	pr_info("Expected promoted pages: %u\n", nr_promote);
 
-	nr_demote = migrate_page_list(&demote_pages, SLOWMEM, pids[0]);
-	nr_promote = migrate_page_list(&promote_pages, FASTMEM, pids[0]);
+	nr_demote = migrate_page_list(&demote_pages, SLOWMEM, pids[0], COLD);
+	nr_promote = migrate_page_list(&promote_pages, FASTMEM, pids[0], HOT);
 
 	pr_info("Real demoted pages: %u\n", nr_demote/512);
 	pr_info("Real promoted pages: %u\n", nr_promote/512);
@@ -943,10 +964,10 @@ static void corun_migration(void)
 	pr_info("BE - Expected demoted pages: %u\n", nr_demote[be]);
 	pr_info("BE - Expected promoted pages: %u\n", nr_promote[be]);
 
-	nr_demote[be] = migrate_page_list(&demote_pages[be], SLOWMEM, pids[be]);
-	nr_demote[lc] = migrate_page_list(&demote_pages[lc], SLOWMEM, pids[lc]);
-	nr_promote[lc] = migrate_page_list(&promote_pages[lc], FASTMEM, pids[lc]);
-	nr_promote[be] = migrate_page_list(&promote_pages[be], FASTMEM, pids[be]);
+	nr_demote[be] = migrate_page_list(&demote_pages[be], SLOWMEM, pids[be], COLD);
+	nr_demote[lc] = migrate_page_list(&demote_pages[lc], SLOWMEM, pids[lc], COLD);
+	nr_promote[lc] = migrate_page_list(&promote_pages[lc], FASTMEM, pids[lc], HOT);
+	nr_promote[be] = migrate_page_list(&promote_pages[be], FASTMEM, pids[be], HOT);
 
 	pr_info("LC - Real demoted pages: %u\n", nr_demote[lc]/512);
 	pr_info("LC - Real promoted pages: %u\n", nr_promote[lc]/512);
@@ -975,8 +996,8 @@ static void hemem_migration(void)
 	pr_info("Expected demoted pages: %u\n", nr_demote);
 	pr_info("Expected promoted pages: %u\n", nr_promote);
 
-	nr_demote = migrate_page_list(&demote_pages, SLOWMEM, pids[0]);
-	nr_promote = migrate_page_list(&promote_pages, FASTMEM, pids[0]);
+	nr_demote = migrate_page_list(&demote_pages, SLOWMEM, pids[0], COLD);
+	nr_promote = migrate_page_list(&promote_pages, FASTMEM, pids[0], HOT);
 
 	pr_info("Real demoted pages: %u\n", nr_demote/512);
 	pr_info("Real promoted pages: %u\n", nr_promote/512);
