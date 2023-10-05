@@ -12,6 +12,8 @@ static int hot_write_threshold = 4;
 module_param(hot_write_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 static int cool_threshold = 18;
 module_param(cool_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+static int warm_set_size = -1; // 2MB page 개수
+module_param(warm_set_size, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 
 /*
  * Util funtions
@@ -890,9 +892,9 @@ static void solorun_migration(void)
 	nr_fmem_cold = get_num_pages(&cold_pages[0][FASTMEM]);
 	target_promote = min(nr_fmem_free + nr_fmem_cold, get_num_pages(&hot_pages[0][SLOWMEM]));
 	target_demote = max(0, target_promote - nr_fmem_free);
-	if (WARM_SET_SIZE >= 0 && 
-		nr_fmem_cold - target_demote > WARM_SET_SIZE)
-		target_demote = nr_fmem_cold - WARM_SET_SIZE;
+	if (warm_set_size >= 0 && 
+		nr_fmem_cold - target_demote > warm_set_size)
+		target_demote = nr_fmem_cold - warm_set_size;
 
 	nr_promote = isolate_mtat_pages(&hot_pages[0][SLOWMEM], &promote_pages, target_promote);
 	nr_demote = isolate_mtat_pages(&cold_pages[0][FASTMEM], &demote_pages, target_demote);
@@ -947,12 +949,12 @@ static void corun_migration(void)
 	target_promote[lc][HOT] = min(nr_fmem_free + nr_fmem_cold[lc] + nr_fmem_cold[be],
 				get_num_pages(&hot_pages[lc][SLOWMEM]));
 	target_demote[lc][COLD] = max(0, target_promote[lc][HOT] - nr_fmem_free - nr_fmem_cold[be]);
-	if (WARM_SET_SIZE >= 0) {
+	if (warm_set_size >= 0) {
 		int lc_remain_cold = nr_fmem_cold[lc] - target_demote[lc][COLD];
-		if (lc_remain_cold > WARM_SET_SIZE) {
-			target_demote[lc][COLD] = nr_fmem_cold[lc] - WARM_SET_SIZE;
-		} else if (lc_remain_cold < WARM_SET_SIZE) {
-			int leftover = WARM_SET_SIZE - lc_remain_cold;
+		if (lc_remain_cold > warm_set_size) {
+			target_demote[lc][COLD] = nr_fmem_cold[lc] - warm_set_size;
+		} else if (lc_remain_cold < warm_set_size) {
+			int leftover = warm_set_size - lc_remain_cold;
 			if (leftover <= target_demote[lc][COLD])
 				target_demote[lc][COLD] -= leftover;
 			else {

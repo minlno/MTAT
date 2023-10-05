@@ -103,7 +103,6 @@ enum migration_modes {
 //#define MTAT_MIGRATION_MODE CORUN
 #define MTAT_MIGRATION_MODE HEMEM
 //#define MTAT_MIGRATION_MODE TEST_MODE
-#define WARM_SET_SIZE 50 // 2MB page 갯수
 #define ENABLE_MIGRATION 1
 #define ENABLE_MONITOR 0
 #define KMIGRATED_CPU 5
