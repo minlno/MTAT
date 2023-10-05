@@ -8,6 +8,27 @@ static int migrate_on = 0;
 module_param(migrate_on, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 
 /*
+ * Util funtions
+ */
+static void mtat_set_cpu_affinity(int cpu)
+{
+	struct cpumask *mask;
+
+	mask = kzalloc(sizeof(struct cpumask), GFP_KERNEL);
+	if (!mask) {
+		pr_err("Failed to allocate memory for cpumask\n");
+		return;
+	}
+
+	cpumask_clear(mask);
+	cpumask_set_cpu(cpu, mask);
+
+	set_cpus_allowed_ptr(current, mask);
+
+	kfree(mask);
+}
+
+/*
  * Page list related variables and functions
  *
  * lock 규칙:
@@ -479,6 +500,9 @@ static int kpebsd_main(void *data)
 	uint64_t pfn;
 
 	pr_info("kpebsd start\n");
+
+	mtat_set_cpu_affinity(KPEBSD_CPU);
+
 	while (!kthread_should_stop()) {
 		for (config = 0; config < ARRAY_SIZE(configs); config++) {
 			for (cpu = 0; cpu < ncpus; cpu++) {
@@ -1065,6 +1089,10 @@ static void do_migration(void)
 
 static int kmigrated_main(void *data)
 {
+	pr_info("kmigrated start\n");
+
+	mtat_set_cpu_affinity(KMIGRATED_CPU);
+
 	while(!kthread_should_stop()) {
 		print_num_pages();
 		if (migrate_on) {

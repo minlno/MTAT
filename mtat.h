@@ -15,6 +15,7 @@
 #include <linux/spinlock.h>
 #include <linux/mutex.h>
 #include <linux/vmalloc.h>
+#include <linux/cpumask.h>
 #include <asm-generic/io.h>
 
 #define PID_NONE -1
@@ -89,6 +90,7 @@ struct perf_sample {
 #define DRAM_READ 0x01d3
 #define STORE_ALL 0x82d0
 #define SAMPLE_PERIOD_PEBS 10007
+#define KPEBSD_CPU 4
 
 /*
  * Migration
@@ -107,6 +109,7 @@ enum migration_modes {
 #define WARM_SET_SIZE 50 // 2MB page 갯수
 #define ENABLE_MIGRATION 1
 #define ENABLE_MONITOR 0
+#define KMIGRATED_CPU 5
 
 struct migration_target_control {
 	int nid;
