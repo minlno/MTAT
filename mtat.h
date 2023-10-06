@@ -33,19 +33,13 @@ enum memory_types {
 	NR_MEM_TYPES
 };
 
-enum access_types {
-	READ_MTAT = 0,
-	WRITE_MTAT = 1,
-	NR_ACCESS_TYPES
-};
-
 // physical page를 나타냄.
 // list를 통해 할당되고 안되고를 표현.
 // 또한 hot인지 cold인지도 list를 통해 표현함.
 struct mtat_page {
 	struct page *page;
 	uint64_t pfn;
-	uint64_t accesses[NR_ACCESS_TYPES];
+	uint64_t accesses;
 	uint64_t local_clock;
 	int hotness;
 	int pids_idx;
@@ -86,7 +80,7 @@ struct perf_sample {
 #define PMEM_READ 0x80d1
 #define DRAM_READ 0x01d3
 #define STORE_ALL 0x82d0
-#define SAMPLE_PERIOD_PEBS 10007
+#define SAMPLE_PERIOD_PEBS 5003 // 10007
 #define KPEBSD_CPU 4
 
 /*
@@ -103,8 +97,6 @@ enum migration_modes {
 //#define MTAT_MIGRATION_MODE CORUN
 #define MTAT_MIGRATION_MODE HEMEM
 //#define MTAT_MIGRATION_MODE TEST_MODE
-#define ENABLE_MIGRATION 1
-#define ENABLE_MONITOR 0
 #define KMIGRATED_CPU 5
 
 struct migration_target_control {
@@ -112,5 +104,10 @@ struct migration_target_control {
 	int pid;
 	int hotness;
 };
+
+/*
+ * Debug
+ */
+#define KDEBUGD_CPU 6
 
 #endif /* __MTAT__ */

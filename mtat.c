@@ -4,16 +4,23 @@
 /*
  * Module parameters
  */
-static int migrate_on = 0;
+static int migrate_on = 1;
 module_param(migrate_on, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-static int hot_read_threshold = 8;
-module_param(hot_read_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-static int hot_write_threshold = 4;
-module_param(hot_write_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-static int cool_threshold = 18;
+static int hot_threshold = 1;
+module_param(hot_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+static int cool_threshold = 2000;
 module_param(cool_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 static int warm_set_size = -1; // 2MB page 개수
 module_param(warm_set_size, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+static int mtat_debug_on = 1; // 2MB page 개수
+module_param(mtat_debug_on, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+
+/*
+ * For Debug
+ */
+static uint64_t debug_nr_sampled[3];
+static uint64_t debug_nr_cooled;
+static spinlock_t debug_lock;
 
 /*
  * Util funtions
@@ -46,7 +53,7 @@ static void mtat_set_cpu_affinity(int cpu)
  *  mtat_page->lock
  *    page_list->lock, lock
  */
-static atomic_t global_clock[MAX_PIDS];
+static uint64_t global_clock[MAX_PIDS];
 static int pids[MAX_PIDS];
 static spinlock_t lock;
 
@@ -63,7 +70,7 @@ struct mtat_page *alloc_and_init_mtat_page(struct page *page)
 
 	m_page->page = page;
 	m_page->pfn = page_to_pfn(page) << PAGE_SHIFT >> HPAGE_SHIFT;
-	memset(m_page->accesses, 0, sizeof(m_page->accesses));
+	m_page->accesses = 0;
 	m_page->local_clock = 0;
 	m_page->hotness = COLD;
 	m_page->pids_idx = PID_NONE;
@@ -147,6 +154,7 @@ void init_page_list(struct page_list *pl)
 	spin_lock_init(&pl->lock);
 }
 
+/*
 static int pid_to_idx(int pid)
 {
 	int i, idx = PID_NONE;
@@ -162,6 +170,7 @@ static int pid_to_idx(int pid)
 
 	return idx;
 }
+*/
 
 /*
  ****************************************
@@ -211,19 +220,23 @@ static void destroy_hashtable(void)
 
 /* 
  **********************************
- * kmonitord thread for debugging *
+ * kdebugd thread for debugging *
  **********************************
  */
-static struct task_struct *kmonitord;
+static struct task_struct *kdebugd;
 
-static void print_num_pages(void)
+static void print_debug_stats(void)
 {
 	int i, j;
+	uint64_t tmp_nr_sampled[3];
+	uint64_t tmp_nr_cooled;
 
 	for (i = 0; i < MAX_PIDS; i++) {
 		if (pids[i] == PID_NONE)
 			continue;
+		pr_info("=======================================\n");
 		pr_info("pid: %d\n", pids[i]);
+		pr_info("global_clock: %llu\n", global_clock[i]);
 		for (j = 0; j < NR_MEM_TYPES; j++) {
 			pr_info("--numa node: %d\n", j);
 			pr_info("----free_pages: %d\n", get_num_pages(&f_pages[j]));
@@ -231,20 +244,43 @@ static void print_num_pages(void)
 			pr_info("----cold_pages: %d\n", get_num_pages(&cold_pages[i][j]));
 		}
 	}
+
+	spin_lock(&debug_lock);
+
+	for (i = 0; i < 3; i++)
+		tmp_nr_sampled[i] = debug_nr_sampled[i];
+	tmp_nr_cooled = debug_nr_cooled;
+	memset(debug_nr_sampled, 0, sizeof(debug_nr_sampled));
+
+	debug_nr_cooled = 0;
+	spin_unlock(&debug_lock);
+
+	pr_info("---------------------------------------\n");
+	pr_info("nr_sampled: \n");
+	pr_info("----DRAM_READ: %llu\n", tmp_nr_sampled[0]);
+	pr_info("----PMEM_READ: %llu\n", tmp_nr_sampled[1]);
+	pr_info("----STORE_ALL: %llu\n", tmp_nr_sampled[2]);
+	pr_info("nr_cooled: %llu\n", tmp_nr_cooled);
+	pr_info("=======================================\n");
+
 }
 
-
-static int kmonitord_main(void *data)
+static int kdebugd_main(void *data)
 {
-	while (!kthread_should_stop()) {
-		print_num_pages();
+	pr_info("kdebugd start\n");
 
-		ssleep(4);
+	mtat_set_cpu_affinity(KDEBUGD_CPU);
+
+	while (!kthread_should_stop()) {
+		if (mtat_debug_on)
+			print_debug_stats();
+		ssleep(5);
 	}
+
+	pr_info("kdebugd exit\n");
 
 	return 0;
 }
-
 
 /*
  ****************************************
@@ -347,8 +383,7 @@ static void init_perf_buffer(struct perf_event *pe)
 // m_page->lock을 잡고 호출해야함.
 static bool is_hot_page(struct mtat_page *m_page)
 {
-	if (m_page->accesses[WRITE_MTAT] >= hot_write_threshold
-	  || m_page->accesses[READ_MTAT] >= hot_read_threshold) 
+	if (m_page->accesses  >= hot_threshold)
 		return true;
 	else 
 		return false;
@@ -372,7 +407,7 @@ static void make_cold_page(struct mtat_page *m_page, int pid_idx, int nid)
 
 static void partial_cooling_pid(int pid_idx)
 {
-	int t, i, nid;
+	int t, nid;
 	static struct mtat_page *last_page[NR_MEM_TYPES]; 
 	struct page_list *pl;
 	struct mtat_page *m_page;
@@ -399,10 +434,10 @@ static void partial_cooling_pid(int pid_idx)
 
 			spin_lock(&m_page->lock);
 
-			for (i = 0; i < NR_ACCESS_TYPES; i++) 
-				m_page->accesses[i] >>= 
-					atomic_read(&global_clock[pid_idx]) - m_page->local_clock;
-			m_page->local_clock = atomic_read(&global_clock[pid_idx]);
+			if (global_clock[pid_idx] > m_page->local_clock)
+				m_page->accesses >>= 
+					global_clock[pid_idx] - m_page->local_clock;
+			m_page->local_clock = global_clock[pid_idx];
 
 			if (!is_hot_page(m_page)) {
 				nr_cooled++;
@@ -419,7 +454,10 @@ static void partial_cooling_pid(int pid_idx)
 			spin_unlock(&m_page->lock);
 		}
 	}
-	pr_info("cooled pages: %d\n", nr_cooled);
+
+	spin_lock(&debug_lock);
+	debug_nr_cooled += nr_cooled;
+	spin_unlock(&debug_lock);
 }
 
 static void partial_cooling(void)
@@ -435,6 +473,7 @@ static void partial_cooling(void)
 }
 
 
+/*
 static uint64_t perf_virt_to_phys(u64 virt)
 {
 	uint64_t phys_addr = 0;
@@ -459,8 +498,9 @@ static uint64_t perf_virt_to_phys(u64 virt)
 	}
 	return phys_addr;
 }
+*/
 
-static void pebs_sample(uint64_t pfn, int access_type) 
+static void pebs_sample(uint64_t pfn) 
 {
 	int nid, pid_idx;
 	struct mtat_page *m_page = NULL;
@@ -475,10 +515,12 @@ static void pebs_sample(uint64_t pfn, int access_type)
 	pid_idx = m_page->pids_idx;
 	nid = m_page->nid;
 
-	m_page->accesses[access_type] >>= atomic_read(&global_clock[pid_idx]) - m_page->local_clock;
-	m_page->local_clock = atomic_read(&global_clock[pid_idx]);
+	if (global_clock[pid_idx] > m_page->local_clock) {
+		m_page->accesses >>= global_clock[pid_idx] - m_page->local_clock;
+	}
+	m_page->local_clock = global_clock[pid_idx];
 
-	m_page->accesses[access_type]++;
+	m_page->accesses++;
 	if (is_hot_page(m_page)) {
 		if (m_page->hotness != HOT)
 			make_hot_page(m_page, pid_idx, nid);
@@ -487,8 +529,9 @@ static void pebs_sample(uint64_t pfn, int access_type)
 			make_cold_page(m_page, pid_idx, nid);
 	}
 		
-	if (m_page->accesses[access_type] > cool_threshold) {
-		atomic_inc(&global_clock[pid_idx]);
+	if (m_page->accesses > cool_threshold) {
+		pr_info("clock increase -> count: %llu\n", m_page->accesses);
+		global_clock[pid_idx]++;
 		set_need_cooling(&hot_pages[pid_idx][FASTMEM], true);
 		set_need_cooling(&hot_pages[pid_idx][SLOWMEM], true);
 	}
@@ -504,7 +547,6 @@ static int kpebsd_main(void *data)
 	struct perf_sample *ps;
 	char *pbuf;
 	size_t idx, config, cpu, ncpus = num_online_cpus();
-	int access_type;
 	uint64_t pfn;
 
 	pr_info("kpebsd start\n");
@@ -538,10 +580,17 @@ static int kpebsd_main(void *data)
 						continue;
 					}
 
-					//pfn = perf_virt_to_phys(ps->addr) >> HPAGE_SHIFT;
+					spin_lock(&debug_lock);
+					if (configs[config] == DRAM_READ)
+						debug_nr_sampled[0]++;
+					else if (configs[config] == PMEM_READ)
+						debug_nr_sampled[1]++;
+					else
+						debug_nr_sampled[2]++;
+					spin_unlock(&debug_lock);
+
 					pfn = ps->phys_addr >> HPAGE_SHIFT;
-					access_type = configs[config] == STORE_ALL ? WRITE_MTAT : READ_MTAT;
-					pebs_sample(pfn, access_type);
+					pebs_sample(pfn);
 					break;
 				}
 				p->data_tail += ph->size;
@@ -671,6 +720,7 @@ static void build_page_list(void)
 	struct page *page;
 
 	spin_lock_init(&lock);
+	spin_lock_init(&debug_lock);
 	memset(global_clock, 0, sizeof(global_clock));
 	for (i = 0; i < NR_MEM_TYPES; i++) 
 		init_page_list(&f_pages[i]);
@@ -728,11 +778,11 @@ static void reserve_page(struct hstate *h, int nid, pid_t pid,
 m_page_init:
 	spin_lock(&m_page->lock);
 
-	m_page->local_clock = atomic_read(&global_clock[i]);
+	m_page->local_clock = global_clock[i];
 	m_page->hotness = COLD;
 	m_page->pids_idx = i;
 	m_page->nid = nid;
-	memset(m_page->accesses, 0, sizeof(m_page->accesses));
+	m_page->accesses = 0;
 	page_list_del(m_page, &f_pages[nid]);
 	page_list_add(m_page, &cold_pages[i][nid]);
 
@@ -804,8 +854,7 @@ static void sync_mtat_page_after_migration(struct migration_target_control *mtc,
 	spin_lock(&m_page->lock);
 	
 	if (mtc->hotness == HOT) {
-		m_page->accesses[READ_MTAT] = hot_read_threshold;
-		m_page->accesses[WRITE_MTAT] = hot_write_threshold;
+		m_page->accesses = hot_threshold;
 		make_hot_page(m_page, m_page->pids_idx, m_page->nid);
 	}
 
@@ -850,7 +899,7 @@ static unsigned int migrate_page_list(struct list_head *page_list, int nid, int 
 	if (migrate_pages(page_list, mtat_alloc_migration_target,
 				NULL, (unsigned long)&mtc, MIGRATE_SYNC,
 				MR_NUMA_MISPLACED, &nr_migrated_pages)) {
-		pr_err("migration partially failed.\n");
+		//pr_err("migration partially failed.\n");
 		list_for_each_entry_safe(page, page2, page_list, lru) {
 			putback_active_hugepage(page);
 		}
@@ -886,8 +935,6 @@ static void solorun_migration(void)
 	int target_promote, target_demote; 
 	int nr_promote, nr_demote;
 
-	pr_info("%s\n", __func__);
-
 	nr_fmem_free = get_num_pages(&f_pages[FASTMEM]);
 	nr_fmem_cold = get_num_pages(&cold_pages[0][FASTMEM]);
 	target_promote = min(nr_fmem_free + nr_fmem_cold, get_num_pages(&hot_pages[0][SLOWMEM]));
@@ -899,14 +946,8 @@ static void solorun_migration(void)
 	nr_promote = isolate_mtat_pages(&hot_pages[0][SLOWMEM], &promote_pages, target_promote);
 	nr_demote = isolate_mtat_pages(&cold_pages[0][FASTMEM], &demote_pages, target_demote);
 
-	pr_info("Expected demoted pages: %u\n", nr_demote);
-	pr_info("Expected promoted pages: %u\n", nr_promote);
-
 	nr_demote = migrate_page_list(&demote_pages, SLOWMEM, pids[0], COLD);
 	nr_promote = migrate_page_list(&promote_pages, FASTMEM, pids[0], HOT);
-
-	pr_info("Real demoted pages: %u\n", nr_demote/512);
-	pr_info("Real promoted pages: %u\n", nr_promote/512);
 }
 
 /*
@@ -926,7 +967,6 @@ static void corun_migration(void)
 	int target_promote[2][2], target_demote[2][2]; // [lc/be][HOT/COLD]
 	int nr_promote[2], nr_demote[2]; // [lc/be]
 	int i, j;
-	pr_info("%s\n", __func__);
 
 	for (i = 0; i < 2; i++) {
 		for (j = 0; j < 2; j++) {
@@ -991,20 +1031,10 @@ static void corun_migration(void)
 	}
 
 	/* Do Migration */
-	pr_info("LC - Expected demoted pages: %u\n", nr_demote[lc]);
-	pr_info("LC - Expected promoted pages: %u\n", nr_promote[lc]);
-	pr_info("BE - Expected demoted pages: %u\n", nr_demote[be]);
-	pr_info("BE - Expected promoted pages: %u\n", nr_promote[be]);
-
 	nr_demote[be] = migrate_page_list(&demote_pages[be], SLOWMEM, pids[be], COLD);
 	nr_demote[lc] = migrate_page_list(&demote_pages[lc], SLOWMEM, pids[lc], COLD);
 	nr_promote[lc] = migrate_page_list(&promote_pages[lc], FASTMEM, pids[lc], HOT);
 	nr_promote[be] = migrate_page_list(&promote_pages[be], FASTMEM, pids[be], HOT);
-
-	pr_info("LC - Real demoted pages: %u\n", nr_demote[lc]/512);
-	pr_info("LC - Real promoted pages: %u\n", nr_promote[lc]/512);
-	pr_info("BE - Real demoted pages: %u\n", nr_demote[be]/512);
-	pr_info("BE - Real promoted pages: %u\n", nr_promote[be]/512);
 }
 
 static void hemem_migration(void)
@@ -1015,8 +1045,6 @@ static void hemem_migration(void)
 	int target_promote, target_demote; 
 	int nr_promote, nr_demote;
 
-	pr_info("%s\n", __func__);
-
 	nr_fmem_free = get_num_pages(&f_pages[FASTMEM]);
 	nr_fmem_cold = get_num_pages(&cold_pages[0][FASTMEM]);
 	target_promote = min(nr_fmem_free + nr_fmem_cold, get_num_pages(&hot_pages[0][SLOWMEM]));
@@ -1025,14 +1053,8 @@ static void hemem_migration(void)
 	nr_promote = isolate_mtat_pages(&hot_pages[0][SLOWMEM], &promote_pages, target_promote);
 	nr_demote = isolate_mtat_pages(&cold_pages[0][FASTMEM], &demote_pages, target_demote);
 
-	pr_info("Expected demoted pages: %u\n", nr_demote);
-	pr_info("Expected promoted pages: %u\n", nr_promote);
-
 	nr_demote = migrate_page_list(&demote_pages, SLOWMEM, pids[0], COLD);
 	nr_promote = migrate_page_list(&promote_pages, FASTMEM, pids[0], HOT);
-
-	pr_info("Real demoted pages: %u\n", nr_demote/512);
-	pr_info("Real promoted pages: %u\n", nr_promote/512);
 }
 
 static void test_migration(void)
@@ -1068,13 +1090,11 @@ static void test_migration(void)
 	spin_unlock(&cold_pages[0][SLOWMEM].lock);
 
 migrate:
-	pr_info("Expected migrated pages: %u\n", nr_pages);
 	mtc.nid = nid;
 	mtc.pid = pids[0];
 	migrate_pages(&folio_list, mtat_alloc_migration_target,
 				NULL, (unsigned long)&mtc, MIGRATE_SYNC,
 				MR_NUMA_MISPLACED, &nr_pages);
-	pr_info("Real migrated pages: %u\n", nr_pages/512);
 }
 
 static void do_migration(void)
@@ -1101,13 +1121,13 @@ static int kmigrated_main(void *data)
 
 	mtat_set_cpu_affinity(KMIGRATED_CPU);
 
-	while(!kthread_should_stop()) {
-		print_num_pages();
+	while (!kthread_should_stop()) {
 		if (migrate_on) {
 			do_migration();
 		}
 		partial_cooling();
-		ssleep(5);
+		if (need_resched())
+			schedule();
 	}
 	pr_info("kmigrated exit\n");
 	return 0;
@@ -1128,24 +1148,16 @@ int init_module(void)
 
 	pebs_start();
 
-	if (!ENABLE_MONITOR)
-		goto kmigrated_label;
-
-	kmonitord = kthread_run(kmonitord_main, NULL, "kmonitord");
-	if (IS_ERR(kmonitord)) {
-		pr_err("Failed to create kmonitord\n");
+	kdebugd = kthread_run(kdebugd_main, NULL, "kdebugd");
+	if (IS_ERR(kdebugd)) {
+		pr_err("Failed to create kdebugd\n");
 	}
-
-kmigrated_label:
-	if (!ENABLE_MIGRATION)
-		goto out;
 
 	kmigrated = kthread_run(kmigrated_main, NULL, "kmigrated");
 	if (IS_ERR(kmigrated)) {
 		pr_err("Failed to create kmigrated\n");
 	}
 
-out:
 	pr_info("Successfully insert MTAT module\n");
 	return 0;
 }
@@ -1155,10 +1167,10 @@ out:
  */
 void cleanup_module(void)
 {
-	if (ENABLE_MIGRATION)
+	if (kmigrated)
 		kthread_stop(kmigrated);
-	if (ENABLE_MONITOR)
-		kthread_stop(kmonitord);
+	if (kdebugd)
+		kthread_stop(kdebugd);
 
 	pebs_stop();
 
