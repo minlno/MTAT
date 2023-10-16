@@ -4,22 +4,29 @@
 /*
  * Module parameters
  */
-static int migrate_on = 1;
+static int migrate_on = 0;
 module_param(migrate_on, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-static int hot_threshold = 1;
+static int hot_threshold = 4;
 module_param(hot_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-static int cool_threshold = 2000;
+static int cool_threshold = 18;
 module_param(cool_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 static int warm_set_size = -1; // 2MB page 개수
 module_param(warm_set_size, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-static int mtat_debug_on = 1; // 2MB page 개수
+static int mtat_debug_on = 1;
 module_param(mtat_debug_on, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+static int mtat_migration_rate = 500; // 2MB page 개수
+module_param(mtat_migration_rate, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+static int mtat_migration_period = 10; // ms
+module_param(mtat_migration_period, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 
 /*
  * For Debug
  */
 static uint64_t debug_nr_sampled[3];
+static uint64_t debug_nr_throttled;
+static uint64_t debug_nr_losted;
 static uint64_t debug_nr_cooled;
+static uint64_t debug_nr_migrated;
 static spinlock_t debug_lock;
 
 /*
@@ -229,7 +236,8 @@ static void print_debug_stats(void)
 {
 	int i, j;
 	uint64_t tmp_nr_sampled[3];
-	uint64_t tmp_nr_cooled;
+	uint64_t tmp_nr_cooled, tmp_nr_migrated;
+	uint64_t tmp_nr_throttled, tmp_nr_losted;
 
 	for (i = 0; i < MAX_PIDS; i++) {
 		if (pids[i] == PID_NONE)
@@ -250,9 +258,15 @@ static void print_debug_stats(void)
 	for (i = 0; i < 3; i++)
 		tmp_nr_sampled[i] = debug_nr_sampled[i];
 	tmp_nr_cooled = debug_nr_cooled;
-	memset(debug_nr_sampled, 0, sizeof(debug_nr_sampled));
+	tmp_nr_migrated = debug_nr_migrated;
+	tmp_nr_throttled = debug_nr_throttled;
+	tmp_nr_losted = debug_nr_losted;
 
+	memset(debug_nr_sampled, 0, sizeof(debug_nr_sampled));
 	debug_nr_cooled = 0;
+	debug_nr_migrated = 0;
+	debug_nr_throttled = 0;
+	debug_nr_losted = 0;
 	spin_unlock(&debug_lock);
 
 	pr_info("---------------------------------------\n");
@@ -260,7 +274,10 @@ static void print_debug_stats(void)
 	pr_info("----DRAM_READ: %llu\n", tmp_nr_sampled[0]);
 	pr_info("----PMEM_READ: %llu\n", tmp_nr_sampled[1]);
 	pr_info("----STORE_ALL: %llu\n", tmp_nr_sampled[2]);
+	pr_info("nr_throttled: %llu\n", tmp_nr_throttled);
+	pr_info("nr_losted: %llu\n", tmp_nr_losted);
 	pr_info("nr_cooled: %llu\n", tmp_nr_cooled);
+	pr_info("nr_migrated: %llu MB\n", tmp_nr_migrated);
 	pr_info("=======================================\n");
 
 }
@@ -530,7 +547,7 @@ static void pebs_sample(uint64_t pfn)
 	}
 		
 	if (m_page->accesses > cool_threshold) {
-		pr_info("clock increase -> count: %llu\n", m_page->accesses);
+		//pr_info("clock increase -> count: %llu\n", m_page->accesses);
 		global_clock[pid_idx]++;
 		set_need_cooling(&hot_pages[pid_idx][FASTMEM], true);
 		set_need_cooling(&hot_pages[pid_idx][SLOWMEM], true);
@@ -592,6 +609,17 @@ static int kpebsd_main(void *data)
 					pfn = ps->phys_addr >> HPAGE_SHIFT;
 					pebs_sample(pfn);
 					break;
+				case PERF_RECORD_THROTTLE:
+				case PERF_RECORD_UNTHROTTLE:
+					spin_lock(&debug_lock);
+					debug_nr_throttled++;
+					spin_unlock(&debug_lock);
+					break;
+				case PERF_RECORD_LOST_SAMPLES:
+					spin_lock(&debug_lock);
+					debug_nr_losted++;
+					spin_unlock(&debug_lock);
+					break;
 				}
 				p->data_tail += ph->size;
 			}
@@ -613,8 +641,8 @@ static void pebs_start(void)
 		.size = sizeof(struct perf_event_attr),
 		//.pinned = 0,
 		.disabled = 0,
-		.precise_ip = 2,
-		.sample_id_all = 1,
+		.precise_ip = 1,
+		//.sample_id_all = 1,
 		.exclude_kernel = 1,
 		.exclude_guest = 1,
 		.exclude_hv = 1,
@@ -905,6 +933,10 @@ static unsigned int migrate_page_list(struct list_head *page_list, int nid, int 
 		}
 	}
 
+	spin_lock(&debug_lock);
+	debug_nr_migrated += nr_migrated_pages * 4 / 1024; // 4KB pages -> MB
+	spin_unlock(&debug_lock);
+
 	return nr_migrated_pages;
 }
 
@@ -942,6 +974,11 @@ static void solorun_migration(void)
 	if (warm_set_size >= 0 && 
 		nr_fmem_cold - target_demote > warm_set_size)
 		target_demote = nr_fmem_cold - warm_set_size;
+	
+	if (target_promote > mtat_migration_rate/2)
+		target_promote = mtat_migration_rate/2;
+	if (target_demote > mtat_migration_rate/2)
+		target_demote = mtat_migration_rate/2;
 
 	nr_promote = isolate_mtat_pages(&hot_pages[0][SLOWMEM], &promote_pages, target_promote);
 	nr_demote = isolate_mtat_pages(&cold_pages[0][FASTMEM], &demote_pages, target_demote);
@@ -958,13 +995,14 @@ static void solorun_migration(void)
  */
 static void corun_migration(void)
 {
-	struct list_head promote_pages[2]; // [lc/be]
-	struct list_head demote_pages[2]; // [lc/be]
+	struct list_head promote_pages[2][2]; // [lc/be]
+	struct list_head demote_pages[2][2]; // [lc/be]
 	const int lc = 0, be = 1;
 	int nr_fmem_free;
 	int nr_fmem_hot[2], nr_fmem_cold[2]; // [lc/be]
 	int nr_smem_hot[2], nr_smem_cold[2]; // [lc/be]
 	int target_promote[2][2], target_demote[2][2]; // [lc/be][HOT/COLD]
+	int total_promote = 0, total_demote = 0;
 	int nr_promote[2], nr_demote[2]; // [lc/be]
 	int i, j;
 
@@ -972,9 +1010,9 @@ static void corun_migration(void)
 		for (j = 0; j < 2; j++) {
 			target_promote[i][j] = 0;
 			target_demote[i][j] = 0;
+			INIT_LIST_HEAD(&promote_pages[i][j]);
+			INIT_LIST_HEAD(&demote_pages[i][j]);
 		}
-		INIT_LIST_HEAD(&promote_pages[i]);
-		INIT_LIST_HEAD(&demote_pages[i]);
 	}
 
 	nr_fmem_free = get_num_pages(&f_pages[FASTMEM]);
@@ -1018,23 +1056,52 @@ static void corun_migration(void)
 		target_promote[be][COLD] = max(0, leftover - target_promote[be][HOT]);
 	}
 
+	// migration rate limit
+	for (i = 0; i < 2; i++) {
+		total_promote += target_promote[i][HOT] + target_promote[i][COLD];
+		total_demote += target_demote[i][HOT] + target_demote[i][COLD];
+	}
+	if (total_promote + total_demote > mtat_migration_rate) {
+		for (i = 1; i >=0; i--) {
+			for (j = 1; j >= 0; j--) {
+				total_promote -= target_promote[i][j];
+				target_promote[i][j] = 0;
+				if (total_promote < mtat_migration_rate/2) {
+					target_promote[i][j] = mtat_migration_rate/2 - total_promote;
+					total_promote = mtat_migration_rate/2;
+				}
+				total_demote -= target_demote[i][j];
+				target_demote[i][j] = 0;
+				if (total_demote < mtat_migration_rate/2) {
+					target_demote[i][j] = mtat_migration_rate/2 - total_demote;
+					total_demote = mtat_migration_rate/2;
+				}
+
+			}
+		}
+	}
+
 	/* Isolate pages for migration */
 	for (i = 0; i < 2; i++) {
 		nr_promote[i] = isolate_mtat_pages(&hot_pages[i][SLOWMEM], 
-					&promote_pages[i], target_promote[i][HOT]);
+					&promote_pages[i][HOT], target_promote[i][HOT]);
 		nr_promote[i] += isolate_mtat_pages(&cold_pages[i][SLOWMEM], 
-					&promote_pages[i], target_promote[i][COLD]);
+					&promote_pages[i][COLD], target_promote[i][COLD]);
 		nr_demote[i] = isolate_mtat_pages(&hot_pages[i][FASTMEM], 
-					&demote_pages[i], target_demote[i][HOT]);
+					&demote_pages[i][HOT], target_demote[i][HOT]);
 		nr_demote[i] += isolate_mtat_pages(&cold_pages[i][FASTMEM], 
-					&demote_pages[i], target_demote[i][COLD]);
+					&demote_pages[i][COLD], target_demote[i][COLD]);
 	}
 
 	/* Do Migration */
-	nr_demote[be] = migrate_page_list(&demote_pages[be], SLOWMEM, pids[be], COLD);
-	nr_demote[lc] = migrate_page_list(&demote_pages[lc], SLOWMEM, pids[lc], COLD);
-	nr_promote[lc] = migrate_page_list(&promote_pages[lc], FASTMEM, pids[lc], HOT);
-	nr_promote[be] = migrate_page_list(&promote_pages[be], FASTMEM, pids[be], HOT);
+	migrate_page_list(&demote_pages[be][COLD], SLOWMEM, pids[be], COLD);
+	migrate_page_list(&demote_pages[be][HOT], SLOWMEM, pids[be], HOT);
+	migrate_page_list(&demote_pages[lc][COLD], SLOWMEM, pids[lc], COLD);
+	migrate_page_list(&demote_pages[lc][HOT], SLOWMEM, pids[lc], HOT);
+	migrate_page_list(&promote_pages[lc][HOT], FASTMEM, pids[lc], HOT);
+	migrate_page_list(&promote_pages[lc][COLD], FASTMEM, pids[lc], COLD);
+	migrate_page_list(&promote_pages[be][HOT], FASTMEM, pids[be], HOT);
+	migrate_page_list(&promote_pages[be][COLD], FASTMEM, pids[be], COLD);
 }
 
 static void hemem_migration(void)
@@ -1049,6 +1116,11 @@ static void hemem_migration(void)
 	nr_fmem_cold = get_num_pages(&cold_pages[0][FASTMEM]);
 	target_promote = min(nr_fmem_free + nr_fmem_cold, get_num_pages(&hot_pages[0][SLOWMEM]));
 	target_demote = max(0, target_promote - nr_fmem_free);
+
+	if (target_promote > mtat_migration_rate/2)
+		target_promote = mtat_migration_rate/2;
+	if (target_demote > mtat_migration_rate/2)
+		target_demote = mtat_migration_rate/2;
 
 	nr_promote = isolate_mtat_pages(&hot_pages[0][SLOWMEM], &promote_pages, target_promote);
 	nr_demote = isolate_mtat_pages(&cold_pages[0][FASTMEM], &demote_pages, target_demote);
@@ -1126,6 +1198,7 @@ static int kmigrated_main(void *data)
 			do_migration();
 		}
 		partial_cooling();
+		msleep(mtat_migration_period);
 		if (need_resched())
 			schedule();
 	}

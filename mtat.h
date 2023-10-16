@@ -94,7 +94,7 @@ enum migration_modes {
 };
 
 //#define MTAT_MIGRATION_MODE SOLORUN
-//#define MTAT_MIGRATION_MODE CORUN
+//#define MTAT_MIGRATION_MODE CORUN // LC, BE 순으로 실행해야함.
 #define MTAT_MIGRATION_MODE HEMEM
 //#define MTAT_MIGRATION_MODE TEST_MODE
 #define KMIGRATED_CPU 5
