@@ -1,12 +1,21 @@
 #include "mtat.h"
 #include "internal.h"
 
+#ifdef CXL_MODE
+static int memory_nodes[] = {0, 1};
+#else
+static int memory_nodes[] = {0, 2};
+#endif
+static int FASTMEM;
+static int SLOWMEM;
+#define NR_MEM_TYPES 3
+
 /*
  * Module parameters
  */
 static int migrate_on = 0;
 module_param(migrate_on, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-static int hot_threshold = 4;
+static int hot_threshold = 1;
 module_param(hot_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 static int cool_threshold = 18;
 module_param(cool_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
@@ -14,7 +23,7 @@ static int warm_set_size = -1; // 2MB page 개수
 module_param(warm_set_size, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 static int mtat_debug_on = 1;
 module_param(mtat_debug_on, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-static int mtat_migration_rate = 500; // 2MB page 개수
+static int mtat_migration_rate = 5000; // 2MB page 개수
 module_param(mtat_migration_rate, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 static int mtat_migration_period = 10; // ms
 module_param(mtat_migration_period, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
@@ -22,7 +31,7 @@ module_param(mtat_migration_period, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 /*
  * For Debug
  */
-static uint64_t debug_nr_sampled[3];
+static uint64_t debug_nr_sampled[4];
 static uint64_t debug_nr_throttled;
 static uint64_t debug_nr_losted;
 static uint64_t debug_nr_cooled;
@@ -246,6 +255,8 @@ static void print_debug_stats(void)
 		pr_info("pid: %d\n", pids[i]);
 		pr_info("global_clock: %llu\n", global_clock[i]);
 		for (j = 0; j < NR_MEM_TYPES; j++) {
+			if (j != memory_nodes[0] && j != memory_nodes[1])
+				continue;
 			pr_info("--numa node: %d\n", j);
 			pr_info("----free_pages: %d\n", get_num_pages(&f_pages[j]));
 			pr_info("----hot_pages: %d\n", get_num_pages(&hot_pages[i][j]));
@@ -273,7 +284,8 @@ static void print_debug_stats(void)
 	pr_info("nr_sampled: \n");
 	pr_info("----DRAM_READ: %llu\n", tmp_nr_sampled[0]);
 	pr_info("----PMEM_READ: %llu\n", tmp_nr_sampled[1]);
-	pr_info("----STORE_ALL: %llu\n", tmp_nr_sampled[2]);
+	pr_info("----CXL_READ: %llu\n", tmp_nr_sampled[2]);
+	pr_info("----STORE_ALL: %llu\n", tmp_nr_sampled[3]);
 	pr_info("nr_throttled: %llu\n", tmp_nr_throttled);
 	pr_info("nr_losted: %llu\n", tmp_nr_losted);
 	pr_info("nr_cooled: %llu\n", tmp_nr_cooled);
@@ -305,7 +317,18 @@ static int kdebugd_main(void *data)
  ****************************************
  */
 static struct perf_event **events;
+
+#ifdef CXL_MODE
+static size_t configs[] = { DRAM_READ, CXL_READ, STORE_ALL };
+#else
 static size_t configs[] = { DRAM_READ, PMEM_READ, STORE_ALL };
+#endif
+
+static size_t cpus[] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,
+					   48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71};
+//static size_t cpus[] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23};
+//static size_t cpus[] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,
+//						25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48};
 static struct task_struct *kpebsd;
 
 static __always_inline enum perf_event_state
@@ -432,6 +455,8 @@ static void partial_cooling_pid(int pid_idx)
 
 	// cooling fastmem
 	for (nid = 0; nid < NR_MEM_TYPES; nid++) {	
+		if (nid != memory_nodes[0] && nid != memory_nodes[1])
+			continue;
 		t = COOL_PAGES;
 		pl = &hot_pages[pid_idx][nid];
 
@@ -563,7 +588,7 @@ static int kpebsd_main(void *data)
 	struct perf_event_header *ph;
 	struct perf_sample *ps;
 	char *pbuf;
-	size_t idx, config, cpu, ncpus = num_online_cpus();
+	size_t idx, config, cpu, i, ncpus = ARRAY_SIZE(cpus);
 	uint64_t pfn;
 
 	pr_info("kpebsd start\n");
@@ -572,7 +597,8 @@ static int kpebsd_main(void *data)
 
 	while (!kthread_should_stop()) {
 		for (config = 0; config < ARRAY_SIZE(configs); config++) {
-			for (cpu = 0; cpu < ncpus; cpu++) {
+			for (i = 0; i < ARRAY_SIZE(cpus); i++) {
+				cpu = cpus[i];
 				idx = config * ncpus + cpu;
 				pe_rb = events[idx]->rb;
 				if (!pe_rb) {
@@ -602,8 +628,10 @@ static int kpebsd_main(void *data)
 						debug_nr_sampled[0]++;
 					else if (configs[config] == PMEM_READ)
 						debug_nr_sampled[1]++;
-					else
+					else if (configs[config] == CXL_READ)
 						debug_nr_sampled[2]++;
+					else
+						debug_nr_sampled[3]++;
 					spin_unlock(&debug_lock);
 
 					pfn = ps->phys_addr >> HPAGE_SHIFT;
@@ -635,7 +663,7 @@ static int kpebsd_main(void *data)
 
 static void pebs_start(void)
 {
-	size_t idx, config, cpu, ncpus = num_online_cpus();
+	size_t idx, config, i, cpu, ncpus = ARRAY_SIZE(cpus);
 	static struct perf_event_attr wd_hw_attr = {
 		.type = PERF_TYPE_RAW,
 		.size = sizeof(struct perf_event_attr),
@@ -659,7 +687,8 @@ static void pebs_start(void)
 	}
 
 	for (config = 0; config < ARRAY_SIZE(configs); config++) {
-		for (cpu = 0; cpu < ncpus; cpu++) {
+		for (i = 0; i < ARRAY_SIZE(cpus); i++) {
+			cpu = cpus[i];
 			idx = config * ncpus + cpu;
 			wd_hw_attr.config = configs[config];
 			wd_hw_attr.sample_period = SAMPLE_PERIOD_PEBS;
@@ -681,16 +710,17 @@ static void pebs_start(void)
 }
 static void pebs_stop(void)
 {
-	size_t idx, config, cpu, ncpus = num_online_cpus();
+	size_t idx, config, cpu, i, ncpus = ARRAY_SIZE(cpus);
 
 	if (kpebsd)
 		kthread_stop(kpebsd);
 
 	for (config = 0; config < ARRAY_SIZE(configs); config++) {
-		for (cpu = 0; cpu < ncpus; cpu++) {
+		for (i = 0; i < ARRAY_SIZE(cpus); i++) {
+			cpu = cpus[i];
 			idx = config * ncpus + cpu;
+			//ring_buffer_put(events[idx]->rb);
 			perf_event_disable(events[idx]);
-			ring_buffer_put(events[idx]->rb);
 			perf_event_release_kernel(events[idx]);
 		}
 	}
@@ -762,6 +792,9 @@ static void build_page_list(void)
 
 	for_each_hstate(h) {
 		for (nid = 0; nid < NR_MEM_TYPES; nid++) {
+			if (nid != memory_nodes[0] && nid != memory_nodes[1])
+				continue;
+
 			list_for_each_entry(page, &h->hugepage_freelists[nid], lru) {
 				if (PageHWPoison(page)) {
 					pr_info("poison\n");
@@ -833,6 +866,8 @@ static struct page *__mtat_allocate_page(struct hstate *h, int nid, pid_t pid)
 	lockdep_assert_held(&hugetlb_lock);
 
 	for (i = 0; i < NR_MEM_TYPES; i++) {
+		if (i != memory_nodes[0] && i != memory_nodes[1])
+			continue;
 		spin_lock(&f_pages[i].lock);
 		m_page = list_first_entry_or_null(&f_pages[i].list, struct mtat_page, list);
 		spin_unlock(&f_pages[i].lock);
@@ -962,18 +997,22 @@ static unsigned int isolate_mtat_pages(struct page_list *from,
 static void solorun_migration(void)
 {
 	LIST_HEAD(promote_pages);
+	LIST_HEAD(promote_pages_cold);
 	LIST_HEAD(demote_pages);
 	int nr_fmem_free, nr_fmem_cold;
-	int target_promote, target_demote; 
+	int target_promote, target_demote, target_promote_cold = 0; 
 	int nr_promote, nr_demote;
 
 	nr_fmem_free = get_num_pages(&f_pages[FASTMEM]);
 	nr_fmem_cold = get_num_pages(&cold_pages[0][FASTMEM]);
 	target_promote = min(nr_fmem_free + nr_fmem_cold, get_num_pages(&hot_pages[0][SLOWMEM]));
 	target_demote = max(0, target_promote - nr_fmem_free);
-	if (warm_set_size >= 0 && 
-		nr_fmem_cold - target_demote > warm_set_size)
-		target_demote = nr_fmem_cold - warm_set_size;
+	if (warm_set_size >= 0)  { 
+		if (nr_fmem_cold < warm_set_size)
+			target_promote_cold = warm_set_size - nr_fmem_cold;
+		if (nr_fmem_cold - target_demote > warm_set_size)
+			target_demote = nr_fmem_cold - warm_set_size;
+	}
 	
 	if (target_promote > mtat_migration_rate/2)
 		target_promote = mtat_migration_rate/2;
@@ -981,10 +1020,12 @@ static void solorun_migration(void)
 		target_demote = mtat_migration_rate/2;
 
 	nr_promote = isolate_mtat_pages(&hot_pages[0][SLOWMEM], &promote_pages, target_promote);
+	nr_promote += isolate_mtat_pages(&cold_pages[0][SLOWMEM], &promote_pages_cold, target_promote_cold);
 	nr_demote = isolate_mtat_pages(&cold_pages[0][FASTMEM], &demote_pages, target_demote);
 
 	nr_demote = migrate_page_list(&demote_pages, SLOWMEM, pids[0], COLD);
 	nr_promote = migrate_page_list(&promote_pages, FASTMEM, pids[0], HOT);
+	nr_promote += migrate_page_list(&promote_pages_cold, FASTMEM, pids[0], COLD);
 }
 
 /*
@@ -1211,6 +1252,9 @@ static int kmigrated_main(void *data)
  */
 int init_module(void)
 {
+	FASTMEM = memory_nodes[0];
+	SLOWMEM = memory_nodes[1];
+
 	if (init_hashtable())
 		return -1;
 

@@ -27,11 +27,7 @@ enum hotness_types {
 	NR_HOTNESS_TYPES
 };
 
-enum memory_types {
-	FASTMEM = 0,
-	SLOWMEM = 1,
-	NR_MEM_TYPES
-};
+//#define CXL_MODE
 
 // physical page를 나타냄.
 // list를 통해 할당되고 안되고를 표현.
@@ -77,7 +73,8 @@ struct perf_sample {
 	u64 phys_addr;
 };
 #define COOL_PAGES 8192
-#define PMEM_READ 0x80d1
+#define PMEM_READ 0x80d1 // Optane
+#define CXL_READ 0x02d3 // CXL
 #define DRAM_READ 0x01d3
 #define STORE_ALL 0x82d0
 #define SAMPLE_PERIOD_PEBS 5003 // 10007
@@ -94,8 +91,8 @@ enum migration_modes {
 };
 
 //#define MTAT_MIGRATION_MODE SOLORUN
-//#define MTAT_MIGRATION_MODE CORUN // LC, BE 순으로 실행해야함.
-#define MTAT_MIGRATION_MODE HEMEM
+#define MTAT_MIGRATION_MODE CORUN // LC, BE 순으로 실행해야함.
+//#define MTAT_MIGRATION_MODE HEMEM
 //#define MTAT_MIGRATION_MODE TEST_MODE
 #define KMIGRATED_CPU 5
 
