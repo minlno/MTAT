@@ -15,15 +15,23 @@ static int SLOWMEM;
  */
 static int migrate_on = 0;
 module_param(migrate_on, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-static int hot_threshold = 1;
-module_param(hot_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-static int cool_threshold = 18;
-module_param(cool_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-static int warm_set_size = -1; // 2MB page 개수
-module_param(warm_set_size, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+static int min_hot_threshold = 1;
+module_param(min_hot_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+
+static int cooling_period = 10000; // ms
+module_param(cooling_period, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+static int zero_cooling_on = 0;
+module_param(zero_cooling_on, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+
+static int min_warm_size = 1000; // 2MB page 개수
+module_param(min_warm_size, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+static int warm_percent = 50; // %
+module_param(warm_percent, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+
 static int mtat_debug_on = 1;
 module_param(mtat_debug_on, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-static int mtat_migration_rate = 5000; // 2MB page 개수
+
+static int mtat_migration_rate = 1000; // 2MB page 개수
 module_param(mtat_migration_rate, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 static int mtat_migration_period = 10; // ms
 module_param(mtat_migration_period, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
@@ -60,16 +68,61 @@ static void mtat_set_cpu_affinity(int cpu)
 }
 
 /*
+ * Access Histogram
+ */
+static struct access_histogram hg[MAX_PIDS];
+static struct list_head total_pages[MAX_PIDS];
+static spinlock_t total_pages_lock[MAX_PIDS];
+
+static void init_hg(void)
+{
+	int i;
+	for (i = 0; i < MAX_PIDS; i++) {
+		spin_lock_init(&hg[i].lock);
+		hg[i].hot_threshold = min_hot_threshold;
+
+		hg[i].nr_sampled = 0;
+		hg[i].warm_size = min_warm_size;
+	}
+}
+
+static uint64_t hg_get_idx(uint64_t num)
+{
+	uint64_t cnt = 0;
+
+	num++;
+	while (1) {
+		num = num >> 1;
+		if (num)
+			cnt++;
+		else return cnt;
+
+		if (cnt == 15)
+			break;
+	}
+	return cnt;
+}
+
+static uint64_t hg_get_accesses(uint64_t idx)
+{
+	uint64_t accesses = 1;
+	if (!idx) return 0;
+	while (--idx)
+		accesses <<= 1;
+	return accesses;
+}
+
+/*
  * Page list related variables and functions
  *
  * lock 규칙:
  * - list_del, list_add 모두 mtat_page->lock,  page_list->lock 잡은 후 수행.
  *
  * lock 순서:
+ * total_pages_lock
  *  mtat_page->lock
- *    page_list->lock, lock
+ *   hg->lock, hot_pages->lock, cold_pages->lock, lock
  */
-static uint64_t global_clock[MAX_PIDS];
 static int pids[MAX_PIDS];
 static spinlock_t lock;
 
@@ -87,11 +140,12 @@ struct mtat_page *alloc_and_init_mtat_page(struct page *page)
 	m_page->page = page;
 	m_page->pfn = page_to_pfn(page) << PAGE_SHIFT >> HPAGE_SHIFT;
 	m_page->accesses = 0;
-	m_page->local_clock = 0;
 	m_page->hotness = COLD;
 	m_page->pids_idx = PID_NONE;
 	m_page->nid = page_to_nid(page);
+	m_page->hg_idx = 0;
 	INIT_LIST_HEAD(&m_page->list);
+	INIT_LIST_HEAD(&m_page->t_list);
 	spin_lock_init(&m_page->lock);
 
 	return m_page;
@@ -108,46 +162,9 @@ int get_num_pages(struct page_list *pl)
 	return num_pages;
 }
 
-bool need_cooling(struct page_list *pl)
-{
-	bool ret;
-
-	spin_lock(&pl->lock);
-	ret = pl->need_cooling;
-	spin_unlock(&pl->lock);
-
-	return ret;
-}
-
-void set_need_cooling(struct page_list *pl, bool cool)
-{
-	spin_lock(&pl->lock);
-	pl->need_cooling = cool;
-	spin_unlock(&pl->lock);
-}
-struct mtat_page *get_curr_cool_page(struct page_list *pl)
-{
-	struct mtat_page *m_page = NULL;
-	spin_lock(&pl->lock);
-	if (!list_empty(&pl->list)) {
-		m_page = pl->curr_cool_page;
-		if (!m_page)
-			m_page = list_first_entry(&pl->list, struct mtat_page, list);
-		pl->curr_cool_page = list_next_entry_circular(m_page, &pl->list, list);
-	}
-	spin_unlock(&pl->lock);
-
-	return m_page;
-}
-
 void page_list_del(struct mtat_page *m_page, struct page_list *pl)
 {
 	spin_lock(&pl->lock);
-	if (m_page == pl->curr_cool_page)  {
-		pl->curr_cool_page = list_next_entry_circular(m_page, &pl->list, list);
-		if (m_page == pl->curr_cool_page)
-			pl->curr_cool_page = NULL;
-	}
 	list_del(&m_page->list);
 	pl->num_pages--;
 	spin_unlock(&pl->lock);
@@ -165,28 +182,8 @@ void init_page_list(struct page_list *pl)
 {
 	INIT_LIST_HEAD(&pl->list);
 	pl->num_pages = 0;
-	pl->need_cooling = false;
-	pl->curr_cool_page = NULL;
 	spin_lock_init(&pl->lock);
 }
-
-/*
-static int pid_to_idx(int pid)
-{
-	int i, idx = PID_NONE;
-
-	spin_lock(&lock);
-	for (i = 0; i < MAX_PIDS; i++) {
-		if (pid == pids[i]) {
-			idx = i;
-			break;
-		}
-	}
-	spin_unlock(&lock);
-
-	return idx;
-}
-*/
 
 /*
  ****************************************
@@ -244,7 +241,7 @@ static struct task_struct *kdebugd;
 static void print_debug_stats(void)
 {
 	int i, j;
-	uint64_t tmp_nr_sampled[3];
+	uint64_t tmp_nr_sampled[4];
 	uint64_t tmp_nr_cooled, tmp_nr_migrated;
 	uint64_t tmp_nr_throttled, tmp_nr_losted;
 
@@ -253,7 +250,6 @@ static void print_debug_stats(void)
 			continue;
 		pr_info("=======================================\n");
 		pr_info("pid: %d\n", pids[i]);
-		pr_info("global_clock: %llu\n", global_clock[i]);
 		for (j = 0; j < NR_MEM_TYPES; j++) {
 			if (j != memory_nodes[0] && j != memory_nodes[1])
 				continue;
@@ -262,11 +258,16 @@ static void print_debug_stats(void)
 			pr_info("----hot_pages: %d\n", get_num_pages(&hot_pages[i][j]));
 			pr_info("----cold_pages: %d\n", get_num_pages(&cold_pages[i][j]));
 		}
+		pr_info("histogram: \n");
+		pr_info("nr_sampled: %llu\n", hg[i].nr_sampled);
+		pr_info("warm_size: %llu\n", hg[i].warm_size);
+		for (j = 0; j < 16; j++)
+			pr_info("%d: %llu", j, hg[i].hg[j]);
 	}
 
 	spin_lock(&debug_lock);
 
-	for (i = 0; i < 3; i++)
+	for (i = 0; i < 4; i++)
 		tmp_nr_sampled[i] = debug_nr_sampled[i];
 	tmp_nr_cooled = debug_nr_cooled;
 	tmp_nr_migrated = debug_nr_migrated;
@@ -283,8 +284,11 @@ static void print_debug_stats(void)
 	pr_info("---------------------------------------\n");
 	pr_info("nr_sampled: \n");
 	pr_info("----DRAM_READ: %llu\n", tmp_nr_sampled[0]);
-	pr_info("----PMEM_READ: %llu\n", tmp_nr_sampled[1]);
+#ifdef CXL_MODE
 	pr_info("----CXL_READ: %llu\n", tmp_nr_sampled[2]);
+#else
+	pr_info("----PMEM_READ: %llu\n", tmp_nr_sampled[1]);
+#endif
 	pr_info("----STORE_ALL: %llu\n", tmp_nr_sampled[3]);
 	pr_info("nr_throttled: %llu\n", tmp_nr_throttled);
 	pr_info("nr_losted: %llu\n", tmp_nr_losted);
@@ -423,7 +427,11 @@ static void init_perf_buffer(struct perf_event *pe)
 // m_page->lock을 잡고 호출해야함.
 static bool is_hot_page(struct mtat_page *m_page)
 {
-	if (m_page->accesses  >= hot_threshold)
+	uint64_t hot_access;
+
+	hot_access = hg_get_accesses(hg[m_page->pids_idx].hot_threshold);
+
+	if (m_page->accesses >= hot_access)
 		return true;
 	else 
 		return false;
@@ -432,6 +440,8 @@ static bool is_hot_page(struct mtat_page *m_page)
 // m_page->lock을 잡고 호출해야함.
 static void make_hot_page(struct mtat_page *m_page, int pid_idx, int nid)
 {
+	if (m_page->hotness == HOT)
+		return;
 	m_page->hotness = HOT;
 	page_list_del(m_page, &cold_pages[pid_idx][nid]);
 	page_list_add(m_page, &hot_pages[pid_idx][nid]);
@@ -440,6 +450,8 @@ static void make_hot_page(struct mtat_page *m_page, int pid_idx, int nid)
 // m_page->lock을 잡고 호출해야함.
 static void make_cold_page(struct mtat_page *m_page, int pid_idx, int nid)
 {
+	if (m_page->hotness == COLD)
+		return;
 	m_page->hotness = COLD;
 	page_list_del(m_page, &hot_pages[pid_idx][nid]);
 	page_list_add(m_page, &cold_pages[pid_idx][nid]);
@@ -447,55 +459,47 @@ static void make_cold_page(struct mtat_page *m_page, int pid_idx, int nid)
 
 static void partial_cooling_pid(int pid_idx)
 {
-	int t, nid;
-	static struct mtat_page *last_page[NR_MEM_TYPES]; 
-	struct page_list *pl;
 	struct mtat_page *m_page;
 	int nr_cooled = 0;
+	int cur_access, prev_idx, cur_idx;
 
-	// cooling fastmem
-	for (nid = 0; nid < NR_MEM_TYPES; nid++) {	
-		if (nid != memory_nodes[0] && nid != memory_nodes[1])
-			continue;
-		t = COOL_PAGES;
-		pl = &hot_pages[pid_idx][nid];
+	spin_lock(&total_pages_lock[pid_idx]);
+	list_for_each_entry(m_page, &total_pages[pid_idx], t_list) {
+		spin_lock(&m_page->lock);
 
-		if (!need_cooling(pl))
-			continue;
+		// 접근횟수 cooling
+		if (zero_cooling_on)
+			m_page->accesses = 0;
+		else
+			m_page->accesses >>= 1;
 
-		while (t--) {
-			if (!last_page[nid]) {
-				spin_lock(&pl->lock);
-				last_page[nid] = list_last_entry(&pl->list, struct mtat_page, list);
-				spin_unlock(&pl->lock);
-			}
+		// 쿨링 후 필요하면 cold list로 보내기
+		if (!is_hot_page(m_page)) {
+			make_cold_page(m_page, pid_idx, m_page->nid);
+		} 
 
-			m_page = get_curr_cool_page(pl);
-			if (!m_page)
-				break;
+		// 히스토그램 인덱스 계산
+		prev_idx = m_page->hg_idx;
+		cur_access = m_page->accesses;
+		cur_idx = hg_get_idx(cur_access);
+		m_page->hg_idx = cur_idx;
 
-			spin_lock(&m_page->lock);
 
-			if (global_clock[pid_idx] > m_page->local_clock)
-				m_page->accesses >>= 
-					global_clock[pid_idx] - m_page->local_clock;
-			m_page->local_clock = global_clock[pid_idx];
 
-			if (!is_hot_page(m_page)) {
-				nr_cooled++;
-				make_cold_page(m_page, pid_idx, nid);
-			}
-			
-			if (m_page == last_page[nid]) {
-				last_page[nid] = NULL;
-				set_need_cooling(pl, false);
-				spin_unlock(&m_page->lock);
-				break;
-			}
+		// 쿨링 후 히스토그램 카운터 관리
+		spin_lock(&hg[pid_idx].lock);
 
-			spin_unlock(&m_page->lock);
-		}
+		hg[pid_idx].hg[prev_idx]--;
+		hg[pid_idx].hg[cur_idx]++;
+		if (cur_idx == 0 && prev_idx != 0)
+			hg[pid_idx].nr_sampled--;
+
+		spin_unlock(&hg[pid_idx].lock);
+		spin_unlock(&m_page->lock);
+
+		nr_cooled++;
 	}
+	spin_unlock(&total_pages_lock[pid_idx]);
 
 	spin_lock(&debug_lock);
 	debug_nr_cooled += nr_cooled;
@@ -509,75 +513,49 @@ static void partial_cooling(void)
 	for (i = 0; i < MAX_PIDS; i++) {
 		if (pids[i] == PID_NONE)
 			break;
-
 		partial_cooling_pid(i);
 	}
 }
-
-
-/*
-static uint64_t perf_virt_to_phys(u64 virt)
-{
-	uint64_t phys_addr = 0;
-
-	if (!virt)
-		return 0;
-
-	if (virt >= TASK_SIZE) {
-		if (virt_addr_valid((void *)(uintptr_t)virt) &&
-		    !(virt >= VMALLOC_START && virt < VMALLOC_END))
-			phys_addr = (uint64_t)virt_to_phys((void *)(uintptr_t)virt);
-	} else {
-		if (current->mm != NULL) {
-			struct page *p;
-			pagefault_disable();
-			if (get_user_page_fast_only(virt, 0, &p)) {
-				phys_addr = (page_to_pfn(p) << PAGE_SHIFT) + virt % PAGE_SIZE;
-				put_page(p);
-			}
-			pagefault_enable();
-		}
-	}
-	return phys_addr;
-}
-*/
 
 static void pebs_sample(uint64_t pfn) 
 {
 	int nid, pid_idx;
 	struct mtat_page *m_page = NULL;
+	uint64_t cur_access, prev_idx, cur_idx;
 
 	m_page = rhashtable_lookup_fast(hashtable, &pfn, params);
 	if (!m_page) {
 		return;
 	}
 	
-	spin_lock(&m_page->lock);
-
 	pid_idx = m_page->pids_idx;
 	nid = m_page->nid;
 
-	if (global_clock[pid_idx] > m_page->local_clock) {
-		m_page->accesses >>= global_clock[pid_idx] - m_page->local_clock;
-	}
-	m_page->local_clock = global_clock[pid_idx];
+	spin_lock(&m_page->lock);
 
+	// 접근횟수 카운팅
 	m_page->accesses++;
+
+	// 히스토그램 관련 인덱스 계산
+	prev_idx = m_page->hg_idx;
+	cur_access = m_page->accesses;
+	cur_idx = hg_get_idx(cur_access);
+	m_page->hg_idx = cur_idx;
+
+	// m_page hot, cold list 관리
 	if (is_hot_page(m_page)) {
-		if (m_page->hotness != HOT)
-			make_hot_page(m_page, pid_idx, nid);
-	} else {
-		if (m_page->hotness != COLD)
-			make_cold_page(m_page, pid_idx, nid);
+		make_hot_page(m_page, pid_idx, nid);
 	}
-		
-	if (m_page->accesses > cool_threshold) {
-		//pr_info("clock increase -> count: %llu\n", m_page->accesses);
-		global_clock[pid_idx]++;
-		set_need_cooling(&hot_pages[pid_idx][FASTMEM], true);
-		set_need_cooling(&hot_pages[pid_idx][SLOWMEM], true);
-	}
-	
+
+	// 히스토그램 카운터 관리
+	spin_lock(&hg[pid_idx].lock);
+
+	hg[pid_idx].hg[prev_idx]--;
+	hg[pid_idx].hg[cur_idx]++;
+	if (prev_idx == 0 && cur_idx != 0)
+		hg[pid_idx].nr_sampled++;
+
+	spin_unlock(&hg[pid_idx].lock);
 	spin_unlock(&m_page->lock);
 }
 
@@ -752,13 +730,19 @@ static int add_freed_page(struct page *page)
 {
 	uint64_t pfn = page_to_pfn(page) << PAGE_SHIFT >> HPAGE_SHIFT;
 	struct mtat_page *m_page = rhashtable_lookup_fast(hashtable, &pfn, params);
+	int hg_idx;
 
 	if (!m_page) {
 		pr_err("Didn't find page %llu\n", pfn);
 		return 0;
 	}
-
+	
+	spin_lock(&total_pages_lock[m_page->pids_idx]);
 	spin_lock(&m_page->lock);
+
+	list_del(&m_page->t_list);
+
+	hg_idx = m_page->hg_idx;
 
 	if (m_page->hotness == HOT)
 		page_list_del(m_page, &hot_pages[m_page->pids_idx][m_page->nid]);
@@ -766,7 +750,17 @@ static int add_freed_page(struct page *page)
 		page_list_del(m_page, &cold_pages[m_page->pids_idx][m_page->nid]);
 	page_list_add(m_page, &f_pages[m_page->nid]);
 
+
+
+	spin_lock(&hg[m_page->pids_idx].lock);
+
+	hg[m_page->pids_idx].hg[hg_idx]--;
+	if (hg_idx != 0)
+		hg[m_page->pids_idx].nr_sampled--;
+
+	spin_unlock(&hg[m_page->pids_idx].lock);
 	spin_unlock(&m_page->lock);
+	spin_unlock(&total_pages_lock[m_page->pids_idx]);
 
 	return 0;
 }
@@ -779,7 +773,6 @@ static void build_page_list(void)
 
 	spin_lock_init(&lock);
 	spin_lock_init(&debug_lock);
-	memset(global_clock, 0, sizeof(global_clock));
 	for (i = 0; i < NR_MEM_TYPES; i++) 
 		init_page_list(&f_pages[i]);
 	for (i = 0; i < MAX_PIDS; i++) {
@@ -788,6 +781,8 @@ static void build_page_list(void)
 			init_page_list(&hot_pages[i][j]);
 			init_page_list(&cold_pages[i][j]);
 		}
+		INIT_LIST_HEAD(&total_pages[i]);
+		spin_lock_init(&total_pages_lock[i]);
 	}
 
 	for_each_hstate(h) {
@@ -816,11 +811,13 @@ static void reserve_page(struct hstate *h, int nid, pid_t pid,
 {
 	int i;
 
+	/*
 	if (MTAT_MIGRATION_MODE == HEMEM) {
 		i = 0;
 		pids[0] = 0;
 		goto m_page_init;
 	}
+	*/
 
 	spin_lock(&lock);
 	for (i = 0; i < MAX_PIDS; i++) {
@@ -836,18 +833,28 @@ static void reserve_page(struct hstate *h, int nid, pid_t pid,
 		pids[i] = pid;
 	spin_unlock(&lock);
 
-m_page_init:
+//m_page_init:
+	spin_lock(&total_pages_lock[i]);
 	spin_lock(&m_page->lock);
 
-	m_page->local_clock = global_clock[i];
 	m_page->hotness = COLD;
 	m_page->pids_idx = i;
 	m_page->nid = nid;
 	m_page->accesses = 0;
+	m_page->hg_idx = 0;
 	page_list_del(m_page, &f_pages[nid]);
 	page_list_add(m_page, &cold_pages[i][nid]);
 
+	list_add_tail(&m_page->t_list, &total_pages[i]);
+
+
+	spin_lock(&hg[m_page->pids_idx].lock);
+
+	hg[m_page->pids_idx].hg[0]++;
+
+	spin_unlock(&hg[m_page->pids_idx].lock);
 	spin_unlock(&m_page->lock);
+	spin_unlock(&total_pages_lock[i]);
 
 
 	list_move(&m_page->page->lru, &h->hugepage_activelist);
@@ -914,15 +921,28 @@ static struct task_struct *kmigrated;
 static void sync_mtat_page_after_migration(struct migration_target_control *mtc,
 		struct mtat_page *m_page)
 {
+	int prev_idx, cur_idx;
+	if (mtc->hotness == COLD)
+		return;
+
 	spin_lock(&m_page->lock);
 	
-	if (mtc->hotness == HOT) {
-		m_page->accesses = hot_threshold;
-		make_hot_page(m_page, m_page->pids_idx, m_page->nid);
-	}
+	prev_idx = m_page->hg_idx;
+	m_page->accesses = hg_get_accesses(min_hot_threshold);
+	make_hot_page(m_page, m_page->pids_idx, m_page->nid);
+	cur_idx = hg_get_idx(m_page->accesses);
+	m_page->hg_idx = cur_idx;
 
+	spin_lock(&hg[m_page->pids_idx].lock);
+
+	hg[m_page->pids_idx].hg[prev_idx]--;
+	hg[m_page->pids_idx].hg[cur_idx]++;
+	hg[m_page->pids_idx].nr_sampled++;
+
+	spin_unlock(&hg[m_page->pids_idx].lock);
 	spin_unlock(&m_page->lock);
-}
+
+	}
 
 static struct page *mtat_alloc_migration_target(struct page *old, unsigned long private)
 {
@@ -1002,16 +1022,24 @@ static void solorun_migration(void)
 	int nr_fmem_free, nr_fmem_cold;
 	int target_promote, target_demote, target_promote_cold = 0; 
 	int nr_promote, nr_demote;
+	uint64_t warm_size;
+	
+	spin_lock(&hg[0].lock);
+	hg[0].warm_size = hg[0].nr_sampled * warm_percent / 100;
+	if (hg[0].warm_size < min_warm_size)
+		hg[0].warm_size = min_warm_size;
+	warm_size = hg[0].warm_size;
+	spin_unlock(&hg[0].lock);
 
 	nr_fmem_free = get_num_pages(&f_pages[FASTMEM]);
 	nr_fmem_cold = get_num_pages(&cold_pages[0][FASTMEM]);
 	target_promote = min(nr_fmem_free + nr_fmem_cold, get_num_pages(&hot_pages[0][SLOWMEM]));
 	target_demote = max(0, target_promote - nr_fmem_free);
-	if (warm_set_size >= 0)  { 
-		if (nr_fmem_cold < warm_set_size)
-			target_promote_cold = warm_set_size - nr_fmem_cold;
-		if (nr_fmem_cold - target_demote > warm_set_size)
-			target_demote = nr_fmem_cold - warm_set_size;
+	if (warm_size >= 0)  { 
+		if (nr_fmem_cold < warm_size)
+			target_promote_cold = warm_size - nr_fmem_cold;
+		if (nr_fmem_cold - target_demote > warm_size)
+			target_demote = nr_fmem_cold - warm_size;
 	}
 	
 	if (target_promote > mtat_migration_rate/2)
@@ -1068,6 +1096,7 @@ static void corun_migration(void)
 	target_promote[lc][HOT] = min(nr_fmem_free + nr_fmem_cold[lc] + nr_fmem_cold[be],
 				get_num_pages(&hot_pages[lc][SLOWMEM]));
 	target_demote[lc][COLD] = max(0, target_promote[lc][HOT] - nr_fmem_free - nr_fmem_cold[be]);
+	/* TODO
 	if (warm_set_size >= 0) {
 		int lc_remain_cold = nr_fmem_cold[lc] - target_demote[lc][COLD];
 		if (lc_remain_cold > warm_set_size) {
@@ -1082,6 +1111,7 @@ static void corun_migration(void)
 			}
 		}
 	}
+	*/
 
 	/* Calculate target_promote, target_demote size for BE */
 	int be_fmem_size = nr_fmem_free + nr_fmem_hot[be] + nr_fmem_cold[be];
@@ -1145,71 +1175,6 @@ static void corun_migration(void)
 	migrate_page_list(&promote_pages[be][COLD], FASTMEM, pids[be], COLD);
 }
 
-static void hemem_migration(void)
-{
-	LIST_HEAD(promote_pages);
-	LIST_HEAD(demote_pages);
-	int nr_fmem_free, nr_fmem_cold;
-	int target_promote, target_demote; 
-	int nr_promote, nr_demote;
-
-	nr_fmem_free = get_num_pages(&f_pages[FASTMEM]);
-	nr_fmem_cold = get_num_pages(&cold_pages[0][FASTMEM]);
-	target_promote = min(nr_fmem_free + nr_fmem_cold, get_num_pages(&hot_pages[0][SLOWMEM]));
-	target_demote = max(0, target_promote - nr_fmem_free);
-
-	if (target_promote > mtat_migration_rate/2)
-		target_promote = mtat_migration_rate/2;
-	if (target_demote > mtat_migration_rate/2)
-		target_demote = mtat_migration_rate/2;
-
-	nr_promote = isolate_mtat_pages(&hot_pages[0][SLOWMEM], &promote_pages, target_promote);
-	nr_demote = isolate_mtat_pages(&cold_pages[0][FASTMEM], &demote_pages, target_demote);
-
-	nr_demote = migrate_page_list(&demote_pages, SLOWMEM, pids[0], COLD);
-	nr_promote = migrate_page_list(&promote_pages, FASTMEM, pids[0], HOT);
-}
-
-static void test_migration(void)
-{
-	LIST_HEAD(folio_list);
-	unsigned int nr_pages;
-	struct mtat_page *m_page = NULL;
-	struct migration_target_control mtc;
-	int nid;
-
-	pr_info("%s\n", __func__);
-
-	nid = SLOWMEM;
-	nr_pages = 0;
-	spin_lock(&cold_pages[0][FASTMEM].lock);
-	list_for_each_entry(m_page, &cold_pages[0][FASTMEM].list, list) {
-		if (isolate_hugetlb(m_page->page, &folio_list))
-			continue;
-		nr_pages++;
-	}
-	spin_unlock(&cold_pages[0][FASTMEM].lock);
-
-	if (nr_pages > 0)
-		goto migrate;
-
-	nid = FASTMEM;
-	spin_lock(&cold_pages[0][SLOWMEM].lock);
-	list_for_each_entry(m_page, &cold_pages[0][SLOWMEM].list, list) {
-		if (isolate_hugetlb(m_page->page, &folio_list))
-			continue;
-		nr_pages++;
-	}
-	spin_unlock(&cold_pages[0][SLOWMEM].lock);
-
-migrate:
-	mtc.nid = nid;
-	mtc.pid = pids[0];
-	migrate_pages(&folio_list, mtat_alloc_migration_target,
-				NULL, (unsigned long)&mtc, MIGRATE_SYNC,
-				MR_NUMA_MISPLACED, &nr_pages);
-}
-
 static void do_migration(void)
 {
 	switch(MTAT_MIGRATION_MODE) {
@@ -1219,17 +1184,12 @@ static void do_migration(void)
 	case CORUN:
 		corun_migration();
 		break;
-	case HEMEM:
-		hemem_migration();
-		break;
-	case TEST_MODE:
-		test_migration();
-		break;
 	}
 }
 
 static int kmigrated_main(void *data)
 {
+	int loop = 0;
 	pr_info("kmigrated start\n");
 
 	mtat_set_cpu_affinity(KMIGRATED_CPU);
@@ -1238,7 +1198,14 @@ static int kmigrated_main(void *data)
 		if (migrate_on) {
 			do_migration();
 		}
-		partial_cooling();
+
+		if (loop * mtat_migration_period >= cooling_period) {
+			loop = 0;
+			partial_cooling();
+		} else {
+			loop++;
+		}
+
 		msleep(mtat_migration_period);
 		if (need_resched())
 			schedule();
@@ -1257,6 +1224,14 @@ int init_module(void)
 
 	if (init_hashtable())
 		return -1;
+
+	init_hg();
+
+	pr_info("hg_get_idx(0): %llu\n", hg_get_idx(0));
+	pr_info("hg_get_idx(1): %llu\n", hg_get_idx(1));
+	pr_info("hg_get_accesses(0): %llu\n", hg_get_accesses(0));
+	pr_info("hg_get_accesses(1): %llu\n", hg_get_accesses(1));
+	pr_info("hg_get_accesses(2): %llu\n", hg_get_accesses(2));
 
 	build_page_list();
 
