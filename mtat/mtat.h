@@ -27,7 +27,7 @@ enum hotness_types {
 	NR_HOTNESS_TYPES
 };
 
-//#define CXL_MODE
+#define CXL_MODE
 
 struct access_histogram {
 	uint64_t hg[16];
@@ -76,7 +76,8 @@ struct perf_sample {
 	struct perf_event_header header;
 	u64 ip;
 	u32 pid, tid;
-	u64 phys_addr;
+	u64 addr;
+	u32 cpu, res;
 };
 #define COOL_PAGES 8192
 #define PMEM_READ 0x80d1 // Optane
@@ -94,8 +95,8 @@ enum migration_modes {
 	CORUN
 };
 
-#define MTAT_MIGRATION_MODE SOLORUN
-//#define MTAT_MIGRATION_MODE CORUN // LC, BE 순으로 실행해야함.
+//#define MTAT_MIGRATION_MODE SOLORUN
+#define MTAT_MIGRATION_MODE CORUN // LC, BE 순으로 실행해야함.
 //#define MTAT_MIGRATION_MODE HEMEM
 //#define MTAT_MIGRATION_MODE TEST_MODE
 #define KMIGRATED_CPU 5

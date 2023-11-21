@@ -1,4 +1,4 @@
-#include "mtat.h"
+#include "hemem.h"
 #include "internal.h"
 
 #ifdef CXL_MODE
@@ -15,7 +15,7 @@ static int SLOWMEM;
  */
 static int migrate_on = 0;
 module_param(migrate_on, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-static int hot_threshold = 1;
+static int hot_threshold = 4;
 module_param(hot_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 static int cool_threshold = 18;
 module_param(cool_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
@@ -27,6 +27,11 @@ static int mtat_migration_rate = 5000; // 2MB page 개수
 module_param(mtat_migration_rate, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 static int mtat_migration_period = 10; // ms
 module_param(mtat_migration_period, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+
+// lc를 첫번째로 실행해야 lc_dram_pages를 알맞게 카운팅함.
+static int lc_dram_pages = 0; // 2MB pages
+module_param(lc_dram_pages, int, S_IRUSR | S_IRGRP | S_IROTH);
+static int lc_pid = 0;
 
 /*
  * For Debug
@@ -758,6 +763,9 @@ static int add_freed_page(struct page *page)
 		return 0;
 	}
 
+	if (m_page->pid == lc_pid && m_page->nid == FASTMEM)
+		lc_dram_pages--;
+
 	spin_lock(&m_page->lock);
 
 	if (m_page->hotness == HOT)
@@ -819,6 +827,10 @@ static void reserve_page(struct hstate *h, int nid, pid_t pid,
 	if (MTAT_MIGRATION_MODE == HEMEM) {
 		i = 0;
 		pids[0] = 0;
+		if (lc_pid == 0)
+			lc_pid = pid;
+		if (lc_pid == pid && nid == FASTMEM)
+			lc_dram_pages++;
 		goto m_page_init;
 	}
 
@@ -842,6 +854,7 @@ m_page_init:
 	m_page->local_clock = global_clock[i];
 	m_page->hotness = COLD;
 	m_page->pids_idx = i;
+	m_page->pid = pid;
 	m_page->nid = nid;
 	m_page->accesses = 0;
 	page_list_del(m_page, &f_pages[nid]);

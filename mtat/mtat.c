@@ -1,5 +1,7 @@
 #include "mtat.h"
 #include "internal.h"
+#include <linux/pid.h>
+#include <linux/sched.h>
 
 #ifdef CXL_MODE
 static int memory_nodes[] = {0, 1};
@@ -15,6 +17,9 @@ static int SLOWMEM;
  */
 static int migrate_on = 0;
 module_param(migrate_on, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+static int pebs_on = 0;
+module_param(pebs_on, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+
 static int min_hot_threshold = 1;
 module_param(min_hot_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 
@@ -27,6 +32,8 @@ static int min_warm_size = 1000; // 2MB page 개수
 module_param(min_warm_size, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 static int warm_percent = 50; // %
 module_param(warm_percent, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+static int static_warm_size = -1; // 2MB page 개수 -1이 아닌경우 무조건 이값으로 warm size를 유지
+module_param(static_warm_size, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 
 static int mtat_debug_on = 1;
 module_param(mtat_debug_on, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
@@ -36,11 +43,16 @@ module_param(mtat_migration_rate, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 static int mtat_migration_period = 10; // ms
 module_param(mtat_migration_period, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 
+static int lc_dram_pages = -1; // 2MB pages
+module_param(lc_dram_pages, int, S_IRUSR | S_IRGRP | S_IROTH);
+
 /*
  * For Debug
  */
 static uint64_t debug_nr_sampled[4];
 static uint64_t debug_nr_throttled;
+static uint64_t debug_nr_found;
+static uint64_t debug_nr_not_found;
 static uint64_t debug_nr_losted;
 static uint64_t debug_nr_cooled;
 static uint64_t debug_nr_migrated;
@@ -65,6 +77,50 @@ static void mtat_set_cpu_affinity(int cpu)
 	set_cpus_allowed_ptr(current, mask);
 
 	kfree(mask);
+}
+
+static uint64_t perf_virt_to_phys(u64 virt, pid_t pid)
+{
+	uint64_t phys_addr = 0;
+	struct task_struct *tsk;
+	struct pid *pid_struct;
+
+	pid_struct = find_get_pid(pid);
+	if (!pid_struct) {
+		//pr_info("pid: %u\n", pid);
+		//pr_info("no pid struct\n");
+		return 0;
+	}
+
+	tsk = pid_task(pid_struct, PIDTYPE_PID);
+	put_pid(pid_struct);
+
+	if (!tsk) {
+		pr_info("no tsk struct\n");
+		return 0;
+	}
+
+	if (!virt)
+		return 0;
+
+	if (virt >= TASK_SIZE) {
+		if (virt_addr_valid((void *)(uintptr_t)virt) &&
+		    !(virt >= VMALLOC_START && virt < VMALLOC_END))
+			phys_addr = (uint64_t)virt_to_phys((void *)(uintptr_t)virt);
+	} else {
+		if (tsk->mm != NULL) {
+			struct page *p;
+			pagefault_disable();
+			if (get_user_pages_remote(tsk->mm, virt, 1, 0, &p, NULL, NULL)) {
+				if (p) {
+					phys_addr = (page_to_pfn(p) << PAGE_SHIFT) + virt % PAGE_SIZE;
+					put_page(p);
+				}
+			}
+			pagefault_enable();
+		}
+	}
+	return phys_addr;
 }
 
 /*
@@ -244,6 +300,7 @@ static void print_debug_stats(void)
 	uint64_t tmp_nr_sampled[4];
 	uint64_t tmp_nr_cooled, tmp_nr_migrated;
 	uint64_t tmp_nr_throttled, tmp_nr_losted;
+	uint64_t tmp_nr_found, tmp_nr_not_found;
 
 	for (i = 0; i < MAX_PIDS; i++) {
 		if (pids[i] == PID_NONE)
@@ -253,32 +310,36 @@ static void print_debug_stats(void)
 		for (j = 0; j < NR_MEM_TYPES; j++) {
 			if (j != memory_nodes[0] && j != memory_nodes[1])
 				continue;
-			pr_info("--numa node: %d\n", j);
-			pr_info("----free_pages: %d\n", get_num_pages(&f_pages[j]));
+			pr_info("--numa node: %d, free_pages: %d\n", j, get_num_pages(&f_pages[j]));
 			pr_info("----hot_pages: %d\n", get_num_pages(&hot_pages[i][j]));
 			pr_info("----cold_pages: %d\n", get_num_pages(&cold_pages[i][j]));
 		}
-		pr_info("histogram: \n");
+		// histogram
 		pr_info("nr_sampled: %llu\n", hg[i].nr_sampled);
 		pr_info("warm_size: %llu\n", hg[i].warm_size);
-		for (j = 0; j < 16; j++)
-			pr_info("%d: %llu", j, hg[i].hg[j]);
+		//for (j = 0; j < 16; j++)
+			//pr_info("%d: %llu", j, hg[i].hg[j]);
 	}
 
 	spin_lock(&debug_lock);
 
 	for (i = 0; i < 4; i++)
 		tmp_nr_sampled[i] = debug_nr_sampled[i];
+	tmp_nr_found = debug_nr_found;
+	tmp_nr_not_found = debug_nr_not_found;
 	tmp_nr_cooled = debug_nr_cooled;
 	tmp_nr_migrated = debug_nr_migrated;
 	tmp_nr_throttled = debug_nr_throttled;
 	tmp_nr_losted = debug_nr_losted;
 
 	memset(debug_nr_sampled, 0, sizeof(debug_nr_sampled));
+	debug_nr_found = 0;
+	debug_nr_not_found = 0;
 	debug_nr_cooled = 0;
 	debug_nr_migrated = 0;
 	debug_nr_throttled = 0;
 	debug_nr_losted = 0;
+
 	spin_unlock(&debug_lock);
 
 	pr_info("---------------------------------------\n");
@@ -290,6 +351,8 @@ static void print_debug_stats(void)
 	pr_info("----PMEM_READ: %llu\n", tmp_nr_sampled[1]);
 #endif
 	pr_info("----STORE_ALL: %llu\n", tmp_nr_sampled[3]);
+	pr_info("nr_found: %llu\n", tmp_nr_found);
+	pr_info("nr_not_found: %llu\n", tmp_nr_not_found);
 	pr_info("nr_throttled: %llu\n", tmp_nr_throttled);
 	pr_info("nr_losted: %llu\n", tmp_nr_losted);
 	pr_info("nr_cooled: %llu\n", tmp_nr_cooled);
@@ -307,7 +370,7 @@ static int kdebugd_main(void *data)
 	while (!kthread_should_stop()) {
 		if (mtat_debug_on)
 			print_debug_stats();
-		ssleep(5);
+		ssleep(1);
 	}
 
 	pr_info("kdebugd exit\n");
@@ -525,8 +588,15 @@ static void pebs_sample(uint64_t pfn)
 
 	m_page = rhashtable_lookup_fast(hashtable, &pfn, params);
 	if (!m_page) {
+		//pr_info("pfn: %llu\n", pfn);
+		spin_lock(&debug_lock);
+		debug_nr_not_found++;
+		spin_unlock(&debug_lock);
 		return;
 	}
+	spin_lock(&debug_lock);
+	debug_nr_found++;
+	spin_unlock(&debug_lock);
 	
 	pid_idx = m_page->pids_idx;
 	nid = m_page->nid;
@@ -567,13 +637,19 @@ static int kpebsd_main(void *data)
 	struct perf_sample *ps;
 	char *pbuf;
 	size_t idx, config, cpu, i, ncpus = ARRAY_SIZE(cpus);
-	uint64_t pfn;
+	uint64_t pfn, pg_index, offset;
+	int page_shift;
 
 	pr_info("kpebsd start\n");
 
 	mtat_set_cpu_affinity(KPEBSD_CPU);
 
 	while (!kthread_should_stop()) {
+		if (!pebs_on) {
+			msleep(5000);
+			continue;
+		}
+
 		for (config = 0; config < ARRAY_SIZE(configs); config++) {
 			for (i = 0; i < ARRAY_SIZE(cpus); i++) {
 				cpu = cpus[i];
@@ -583,7 +659,18 @@ static int kpebsd_main(void *data)
 					pr_info("CPU%lu: rb is NULL\n", cpu);
 					continue;
 				}
-				p = pe_rb->user_page;
+				p = READ_ONCE(pe_rb->user_page);
+				if (p->data_head == p->data_tail)
+					continue;
+				page_shift = PAGE_SHIFT + page_order(pe_rb);
+				offset = READ_ONCE(p->data_tail);
+				pg_index = (offset >> page_shift) & (pe_rb->nr_pages - 1);
+				offset &= (1 << page_shift) - 1;
+
+				ph = (void*)(pe_rb->data_pages[pg_index] + offset);
+
+				/*
+				p = READ_ONCE(pe_rb->user_page);
 				pbuf = (char *)p + p->data_offset;
 
 				smp_rmb();
@@ -592,13 +679,14 @@ static int kpebsd_main(void *data)
 					continue;
 
 				ph = (void *)(pbuf + (p->data_tail % p->data_size));
+				*/
 
 				switch (ph->type) {
 				case PERF_RECORD_SAMPLE:
 					ps = (struct perf_sample *)ph;
 					if (!ps) {
 						pr_err("ps is NULL\n");
-						continue;
+						break;
 					}
 
 					spin_lock(&debug_lock);
@@ -612,7 +700,14 @@ static int kpebsd_main(void *data)
 						debug_nr_sampled[3]++;
 					spin_unlock(&debug_lock);
 
-					pfn = ps->phys_addr >> HPAGE_SHIFT;
+					/*
+					if (cpu != ps->cpu) {
+						pr_info("current cpu: %u\n", cpu);
+						pr_info("sampled cpu: %u\n", ps->cpu);
+					}
+					*/
+
+					pfn = perf_virt_to_phys(ps->addr, ps->pid) >> HPAGE_SHIFT;
 					pebs_sample(pfn);
 					break;
 				case PERF_RECORD_THROTTLE:
@@ -627,10 +722,10 @@ static int kpebsd_main(void *data)
 					spin_unlock(&debug_lock);
 					break;
 				}
-				p->data_tail += ph->size;
+				smp_mb();
+				WRITE_ONCE(p->data_tail, p->data_tail + ph->size);
 			}
 		}
-
 		if (need_resched())
 			schedule();
 	}
@@ -655,7 +750,7 @@ static void pebs_start(void)
 		.exclude_callchain_kernel = 1,
 		.exclude_callchain_user = 1,
 		.exclude_user = 0,
-		.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_PHYS_ADDR,
+		.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_ADDR | PERF_SAMPLE_CPU,
 	};
 
 	events = vmalloc(ncpus * ARRAY_SIZE(configs) * sizeof(*events));
@@ -1014,6 +1109,23 @@ static unsigned int isolate_mtat_pages(struct page_list *from,
 	return nr;
 }
 
+static uint64_t get_warm_size(int hg_idx)
+{
+	uint64_t warm_size;
+
+	if (static_warm_size >= 0)
+		return static_warm_size;
+
+	spin_lock(&hg[hg_idx].lock);
+	hg[hg_idx].warm_size = hg[hg_idx].nr_sampled * warm_percent / 100;
+	if (hg[hg_idx].warm_size < min_warm_size)
+		hg[hg_idx].warm_size = min_warm_size;
+	warm_size = hg[hg_idx].warm_size;
+	spin_unlock(&hg[hg_idx].lock);
+
+	return warm_size;
+}
+
 static void solorun_migration(void)
 {
 	LIST_HEAD(promote_pages);
@@ -1024,13 +1136,8 @@ static void solorun_migration(void)
 	int nr_promote, nr_demote;
 	uint64_t warm_size;
 	
-	spin_lock(&hg[0].lock);
-	hg[0].warm_size = hg[0].nr_sampled * warm_percent / 100;
-	if (hg[0].warm_size < min_warm_size)
-		hg[0].warm_size = min_warm_size;
-	warm_size = hg[0].warm_size;
-	spin_unlock(&hg[0].lock);
-
+	warm_size = get_warm_size(0);
+	
 	nr_fmem_free = get_num_pages(&f_pages[FASTMEM]);
 	nr_fmem_cold = get_num_pages(&cold_pages[0][FASTMEM]);
 	target_promote = min(nr_fmem_free + nr_fmem_cold, get_num_pages(&hot_pages[0][SLOWMEM]));
@@ -1074,6 +1181,9 @@ static void corun_migration(void)
 	int total_promote = 0, total_demote = 0;
 	int nr_promote[2], nr_demote[2]; // [lc/be]
 	int i, j;
+	uint64_t warm_size;
+
+	warm_size = get_warm_size(0);
 
 	for (i = 0; i < 2; i++) {
 		for (j = 0; j < 2; j++) {
@@ -1096,13 +1206,13 @@ static void corun_migration(void)
 	target_promote[lc][HOT] = min(nr_fmem_free + nr_fmem_cold[lc] + nr_fmem_cold[be],
 				get_num_pages(&hot_pages[lc][SLOWMEM]));
 	target_demote[lc][COLD] = max(0, target_promote[lc][HOT] - nr_fmem_free - nr_fmem_cold[be]);
-	/* TODO
-	if (warm_set_size >= 0) {
+
+	if (warm_size >= 0) {
 		int lc_remain_cold = nr_fmem_cold[lc] - target_demote[lc][COLD];
-		if (lc_remain_cold > warm_set_size) {
-			target_demote[lc][COLD] = nr_fmem_cold[lc] - warm_set_size;
-		} else if (lc_remain_cold < warm_set_size) {
-			int leftover = warm_set_size - lc_remain_cold;
+		if (lc_remain_cold > warm_size) {
+			target_demote[lc][COLD] = nr_fmem_cold[lc] - warm_size;
+		} else if (lc_remain_cold < warm_size) {
+			int leftover = warm_size - lc_remain_cold;
 			if (leftover <= target_demote[lc][COLD])
 				target_demote[lc][COLD] -= leftover;
 			else {
@@ -1111,7 +1221,6 @@ static void corun_migration(void)
 			}
 		}
 	}
-	*/
 
 	/* Calculate target_promote, target_demote size for BE */
 	int be_fmem_size = nr_fmem_free + nr_fmem_hot[be] + nr_fmem_cold[be];
@@ -1198,6 +1307,9 @@ static int kmigrated_main(void *data)
 		if (migrate_on) {
 			do_migration();
 		}
+
+		lc_dram_pages = get_num_pages(&hot_pages[0][FASTMEM]) 
+			+ get_num_pages(&cold_pages[0][FASTMEM]);
 
 		if (loop * mtat_migration_period >= cooling_period) {
 			loop = 0;

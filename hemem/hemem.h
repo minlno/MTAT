@@ -27,7 +27,7 @@ enum hotness_types {
 	NR_HOTNESS_TYPES
 };
 
-//#define CXL_MODE
+#define CXL_MODE
 
 // physical page를 나타냄.
 // list를 통해 할당되고 안되고를 표현.
@@ -39,6 +39,7 @@ struct mtat_page {
 	uint64_t local_clock;
 	int hotness;
 	int pids_idx;
+	int pid;
 	int nid;
 	struct rhash_head node;
 	struct list_head list;
