@@ -2,6 +2,8 @@
 #include "internal.h"
 #include <linux/pid.h>
 #include <linux/sched.h>
+#include <linux/sysfs.h>
+#include <linux/kobject.h>
 
 #ifdef CXL_MODE
 static int memory_nodes[] = {0, 1};
@@ -45,6 +47,9 @@ module_param(mtat_migration_period, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 
 static int lc_dram_pages = -1; // 2MB pages
 module_param(lc_dram_pages, int, S_IRUSR | S_IRGRP | S_IROTH);
+static int lc_total_pages = -1; // 2MB pages
+module_param(lc_total_pages, int, S_IRUSR | S_IRGRP | S_IROTH);
+
 
 /*
  * For Debug
@@ -167,6 +172,28 @@ static uint64_t hg_get_accesses(uint64_t idx)
 		accesses <<= 1;
 	return accesses;
 }
+
+/*
+ * Histogram Sysfs
+ */
+static ssize_t lc_hg_show(struct kobject *kobj,
+					struct kobj_attribute *attr, char *buf)
+{
+	int i, len = 0, ret;
+	size_t buf_size = PAGE_SIZE;
+
+	for (i = 0; i < 16; i++) {
+		ret = snprintf(buf + len, buf_size - len, "%llu ", hg[0].hg[i]);
+
+		if (ret >= buf_size - len) 
+			break;
+
+		len += ret;
+	}
+
+	return len;
+}
+static struct kobj_attribute lc_hg_attr = __ATTR_RO(lc_hg);
 
 /*
  * Page list related variables and functions
@@ -1310,6 +1337,8 @@ static int kmigrated_main(void *data)
 
 		lc_dram_pages = get_num_pages(&hot_pages[0][FASTMEM]) 
 			+ get_num_pages(&cold_pages[0][FASTMEM]);
+		lc_total_pages = get_num_pages(&hot_pages[0][SLOWMEM]) 
+			+ get_num_pages(&cold_pages[0][SLOWMEM]) + lc_dram_pages;
 
 		if (loop * mtat_migration_period >= cooling_period) {
 			loop = 0;
@@ -1338,6 +1367,11 @@ int init_module(void)
 		return -1;
 
 	init_hg();
+	if (sysfs_create_file(kernel_kobj, &lc_hg_attr.attr)) {
+		pr_info("failed to create sysfs entry for lc_hg\n");
+		return -1;
+	}
+
 
 	pr_info("hg_get_idx(0): %llu\n", hg_get_idx(0));
 	pr_info("hg_get_idx(1): %llu\n", hg_get_idx(1));
@@ -1382,6 +1416,8 @@ void cleanup_module(void)
 	set_enqueue_hook(NULL);
 
 	destroy_hashtable();
+	
+	sysfs_remove_file(kernel_kobj, &lc_hg_attr.attr);
 
 	pr_info("Remove MTAT module\n");
 }
