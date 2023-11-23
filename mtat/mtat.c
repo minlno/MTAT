@@ -24,31 +24,37 @@ module_param(pebs_on, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 
 static int min_hot_threshold = 1;
 module_param(min_hot_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+static int set_lc_dram_size = 0; // 2MB page 개수 -1이 아닌경우 무조건 이값으로 warm size를 유지
+module_param(set_lc_dram_size, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 
-static int cooling_period = 10000; // ms
+static int cooling_period = 1000; // ms
 module_param(cooling_period, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 static int zero_cooling_on = 0;
 module_param(zero_cooling_on, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 
+/*
 static int min_warm_size = 1000; // 2MB page 개수
 module_param(min_warm_size, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 static int warm_percent = 50; // %
 module_param(warm_percent, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 static int static_warm_size = -1; // 2MB page 개수 -1이 아닌경우 무조건 이값으로 warm size를 유지
 module_param(static_warm_size, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+*/
 
 static int mtat_debug_on = 1;
 module_param(mtat_debug_on, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 
-static int mtat_migration_rate = 1000; // 2MB page 개수
+static int mtat_migration_rate = 5000; // 2MB page 개수
 module_param(mtat_migration_rate, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-static int mtat_migration_period = 10; // ms
+static int mtat_migration_period = 1; // ms
 module_param(mtat_migration_period, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 
 static int lc_dram_pages = -1; // 2MB pages
 module_param(lc_dram_pages, int, S_IRUSR | S_IRGRP | S_IROTH);
 static int lc_total_pages = -1; // 2MB pages
 module_param(lc_total_pages, int, S_IRUSR | S_IRGRP | S_IROTH);
+static int total_dram_pages = -1; // 2MB pages
+module_param(total_dram_pages, int, S_IRUSR | S_IRGRP | S_IROTH);
 
 
 /*
@@ -141,9 +147,9 @@ static void init_hg(void)
 	for (i = 0; i < MAX_PIDS; i++) {
 		spin_lock_init(&hg[i].lock);
 		hg[i].hot_threshold = min_hot_threshold;
+		hg[i].warm_threshold = min_hot_threshold - 1;
 
 		hg[i].nr_sampled = 0;
-		hg[i].warm_size = min_warm_size;
 	}
 }
 
@@ -171,6 +177,27 @@ static uint64_t hg_get_accesses(uint64_t idx)
 	while (--idx)
 		accesses <<= 1;
 	return accesses;
+}
+
+// hg lock 잡지 않고 호출해야함.
+static void hg_update_hot_threshold(uint64_t hg_idx, uint64_t dram_size)
+{
+	uint64_t tmp = 0;
+	int i;
+
+	spin_lock(&hg[hg_idx].lock);
+	for (i = 15; i >= 0; i--) {
+		tmp += hg[hg_idx].hg[i];
+		if (tmp > dram_size) {
+			hg[hg_idx].hot_threshold = i+1;
+			hg[hg_idx].warm_threshold = i;
+			spin_unlock(&hg[hg_idx].lock);
+			return;
+		}
+	}
+	hg[hg_idx].hot_threshold = min_hot_threshold;
+	hg[hg_idx].warm_threshold = min_hot_threshold - 1;
+	spin_unlock(&hg[hg_idx].lock);
 }
 
 /*
@@ -204,14 +231,13 @@ static struct kobj_attribute lc_hg_attr = __ATTR_RO(lc_hg);
  * lock 순서:
  * total_pages_lock
  *  mtat_page->lock
- *   hg->lock, hot_pages->lock, cold_pages->lock, lock
+ *   hg->lock, mtat_pages->lock, lock
  */
 static int pids[MAX_PIDS];
 static spinlock_t lock;
 
 static struct page_list f_pages[NR_MEM_TYPES]; // free_pages
-static struct page_list hot_pages[MAX_PIDS][NR_MEM_TYPES];
-static struct page_list cold_pages[MAX_PIDS][NR_MEM_TYPES];
+static struct page_list mtat_pages[NR_HOTNESS_TYPES][MAX_PIDS][NR_MEM_TYPES];
 
 struct mtat_page *alloc_and_init_mtat_page(struct page *page)
 {
@@ -338,12 +364,12 @@ static void print_debug_stats(void)
 			if (j != memory_nodes[0] && j != memory_nodes[1])
 				continue;
 			pr_info("--numa node: %d, free_pages: %d\n", j, get_num_pages(&f_pages[j]));
-			pr_info("----hot_pages: %d\n", get_num_pages(&hot_pages[i][j]));
-			pr_info("----cold_pages: %d\n", get_num_pages(&cold_pages[i][j]));
+			pr_info("----hot_pages: %d\n", get_num_pages(&mtat_pages[HOT][i][j]));
+			pr_info("----warm_pages: %d\n", get_num_pages(&mtat_pages[WARM][i][j]));
+			pr_info("----cold_pages: %d\n", get_num_pages(&mtat_pages[COLD][i][j]));
 		}
 		// histogram
 		pr_info("nr_sampled: %llu\n", hg[i].nr_sampled);
-		pr_info("warm_size: %llu\n", hg[i].warm_size);
 		//for (j = 0; j < 16; j++)
 			//pr_info("%d: %llu", j, hg[i].hg[j]);
 	}
@@ -515,6 +541,7 @@ static void init_perf_buffer(struct perf_event *pe)
 }
 
 // m_page->lock을 잡고 호출해야함.
+// hg->lock도 필요
 static bool is_hot_page(struct mtat_page *m_page)
 {
 	uint64_t hot_access;
@@ -527,24 +554,46 @@ static bool is_hot_page(struct mtat_page *m_page)
 		return false;
 }
 
-// m_page->lock을 잡고 호출해야함.
-static void make_hot_page(struct mtat_page *m_page, int pid_idx, int nid)
+// m_page->lock 필요
+// hg->lock도 필요
+// hot도 true로 뱉음
+static bool is_warm_page(struct mtat_page *m_page)
 {
-	if (m_page->hotness == HOT)
-		return;
-	m_page->hotness = HOT;
-	page_list_del(m_page, &cold_pages[pid_idx][nid]);
-	page_list_add(m_page, &hot_pages[pid_idx][nid]);
+	uint64_t warm_access;
+	warm_access = hg_get_accesses(hg[m_page->pids_idx].warm_threshold);
+
+	if (m_page->accesses >= warm_access)
+		return true;
+	else 
+		return false;
+
 }
 
-// m_page->lock을 잡고 호출해야함.
-static void make_cold_page(struct mtat_page *m_page, int pid_idx, int nid)
+// m_page->lock 필요
+// hg->lock은 잡으면 안됨.
+static void update_page_list_with_mpage(struct mtat_page *m_page)
 {
-	if (m_page->hotness == COLD)
+	int prev_hotness = m_page->hotness;
+	int cur_hotness;
+	int pids_idx = m_page->pids_idx;
+	int nid = m_page->nid;
+	
+
+	spin_lock(&hg[pids_idx].lock);
+	if (is_hot_page(m_page))
+		cur_hotness = HOT;
+	else if (is_warm_page(m_page))
+		cur_hotness = WARM;
+	else
+		cur_hotness = COLD;
+	spin_unlock(&hg[pids_idx].lock);
+
+	if (prev_hotness == cur_hotness)
 		return;
-	m_page->hotness = COLD;
-	page_list_del(m_page, &hot_pages[pid_idx][nid]);
-	page_list_add(m_page, &cold_pages[pid_idx][nid]);
+
+	m_page->hotness = cur_hotness;
+	page_list_del(m_page, &mtat_pages[prev_hotness][pids_idx][nid]);
+	page_list_add(m_page, &mtat_pages[cur_hotness][pids_idx][nid]);
 }
 
 static void partial_cooling_pid(int pid_idx)
@@ -564,9 +613,7 @@ static void partial_cooling_pid(int pid_idx)
 			m_page->accesses >>= 1;
 
 		// 쿨링 후 필요하면 cold list로 보내기
-		if (!is_hot_page(m_page)) {
-			make_cold_page(m_page, pid_idx, m_page->nid);
-		} 
+		update_page_list_with_mpage(m_page);
 
 		// 히스토그램 인덱스 계산
 		prev_idx = m_page->hg_idx;
@@ -639,10 +686,8 @@ static void pebs_sample(uint64_t pfn)
 	cur_idx = hg_get_idx(cur_access);
 	m_page->hg_idx = cur_idx;
 
-	// m_page hot, cold list 관리
-	if (is_hot_page(m_page)) {
-		make_hot_page(m_page, pid_idx, nid);
-	}
+	// m_page hot, warm, cold list 관리
+	update_page_list_with_mpage(m_page);
 
 	// 히스토그램 카운터 관리
 	spin_lock(&hg[pid_idx].lock);
@@ -866,13 +911,8 @@ static int add_freed_page(struct page *page)
 
 	hg_idx = m_page->hg_idx;
 
-	if (m_page->hotness == HOT)
-		page_list_del(m_page, &hot_pages[m_page->pids_idx][m_page->nid]);
-	else
-		page_list_del(m_page, &cold_pages[m_page->pids_idx][m_page->nid]);
+	page_list_del(m_page, &mtat_pages[m_page->hotness][m_page->pids_idx][m_page->nid]);
 	page_list_add(m_page, &f_pages[m_page->nid]);
-
-
 
 	spin_lock(&hg[m_page->pids_idx].lock);
 
@@ -889,7 +929,7 @@ static int add_freed_page(struct page *page)
 
 static void build_page_list(void)
 {
-	int i, j, nid, nb_pages = 0;
+	int i, j, k, nid, nb_pages = 0;
 	struct hstate *h;
 	struct page *page;
 
@@ -900,8 +940,8 @@ static void build_page_list(void)
 	for (i = 0; i < MAX_PIDS; i++) {
 		pids[i] = PID_NONE;
 		for (j = 0; j < NR_MEM_TYPES; j++) {
-			init_page_list(&hot_pages[i][j]);
-			init_page_list(&cold_pages[i][j]);
+			for (k = 0; k < NR_HOTNESS_TYPES; k++)
+				init_page_list(&mtat_pages[k][i][j]);
 		}
 		INIT_LIST_HEAD(&total_pages[i]);
 		spin_lock_init(&total_pages_lock[i]);
@@ -925,6 +965,7 @@ static void build_page_list(void)
 		}
 	}
 
+	total_dram_pages = get_num_pages(&f_pages[FASTMEM]);
 	pr_info("Successfully created a list of %d pages\n", nb_pages);
 }
 
@@ -965,7 +1006,7 @@ static void reserve_page(struct hstate *h, int nid, pid_t pid,
 	m_page->accesses = 0;
 	m_page->hg_idx = 0;
 	page_list_del(m_page, &f_pages[nid]);
-	page_list_add(m_page, &cold_pages[i][nid]);
+	page_list_add(m_page, &mtat_pages[COLD][i][nid]);
 
 	list_add_tail(&m_page->t_list, &total_pages[i]);
 
@@ -1050,10 +1091,22 @@ static void sync_mtat_page_after_migration(struct migration_target_control *mtc,
 	spin_lock(&m_page->lock);
 	
 	prev_idx = m_page->hg_idx;
-	m_page->accesses = hg_get_accesses(min_hot_threshold);
-	make_hot_page(m_page, m_page->pids_idx, m_page->nid);
+
+	spin_lock(&hg[m_page->pids_idx].lock);
+	switch (mtc->hotness) {
+	case HOT:
+		m_page->accesses = hg_get_accesses(hg[m_page->pids_idx].hot_threshold);
+		break;
+	case WARM:
+		m_page->accesses = hg_get_accesses(hg[m_page->pids_idx].warm_threshold);
+		break;
+	}
+	spin_unlock(&hg[m_page->pids_idx].lock);
+
 	cur_idx = hg_get_idx(m_page->accesses);
 	m_page->hg_idx = cur_idx;
+
+	update_page_list_with_mpage(m_page);
 
 	spin_lock(&hg[m_page->pids_idx].lock);
 
@@ -1123,6 +1176,9 @@ static unsigned int isolate_mtat_pages(struct page_list *from,
 	struct mtat_page *m_page = NULL;
 	int nr = 0;
 
+	if (target_nr == 0)
+		return 0;
+
 	spin_lock(&from->lock);
 	list_for_each_entry(m_page, &from->list, list) {
 		if (nr >= target_nr)
@@ -1136,58 +1192,66 @@ static unsigned int isolate_mtat_pages(struct page_list *from,
 	return nr;
 }
 
-static uint64_t get_warm_size(int hg_idx)
+static void calculate_migration_target_size(int *target_promote,
+		int *target_demote, int pid_idx, int dram_size)
 {
-	uint64_t warm_size;
+	int nr_fmem[NR_HOTNESS_TYPES], nr_smem[NR_HOTNESS_TYPES];
+	int dram_leftover, nr_need_demote = 0, total_dram_size = 0;
+	int i;
+	for (i = 0; i < NR_HOTNESS_TYPES; i++) {
+		nr_fmem[i] = get_num_pages(&mtat_pages[i][pid_idx][FASTMEM]);
+		nr_smem[i] = get_num_pages(&mtat_pages[i][pid_idx][SLOWMEM]);
+		target_promote[i] = 0;
+		target_demote[i] = 0;
 
-	if (static_warm_size >= 0)
-		return static_warm_size;
+		total_dram_size += nr_fmem[i];
+	}
 
-	spin_lock(&hg[hg_idx].lock);
-	hg[hg_idx].warm_size = hg[hg_idx].nr_sampled * warm_percent / 100;
-	if (hg[hg_idx].warm_size < min_warm_size)
-		hg[hg_idx].warm_size = min_warm_size;
-	warm_size = hg[hg_idx].warm_size;
-	spin_unlock(&hg[hg_idx].lock);
+	dram_leftover = dram_size;
+	for (i = 0; i < NR_HOTNESS_TYPES; i++) {
+		dram_leftover = max(0, dram_leftover - nr_fmem[i]);
+		if (dram_leftover == 0)
+			break;
 
-	return warm_size;
+		target_promote[i] = min(dram_leftover, nr_smem[i]);
+		dram_leftover -= target_promote[i];
+		total_dram_size += target_promote[i];
+	}
+
+	nr_need_demote = total_dram_size - dram_size;
+	for (i = NR_HOTNESS_TYPES-1; i >= 0; i--) {
+		if (nr_need_demote <= 0)
+			break;
+		target_demote[i] = min(nr_need_demote, nr_fmem[i]);
+		nr_need_demote -= target_demote[i];
+	}
 }
 
 static void solorun_migration(void)
 {
-	LIST_HEAD(promote_pages);
-	LIST_HEAD(promote_pages_cold);
-	LIST_HEAD(demote_pages);
-	int nr_fmem_free, nr_fmem_cold;
-	int target_promote, target_demote, target_promote_cold = 0; 
-	int nr_promote, nr_demote;
-	uint64_t warm_size;
-	
-	warm_size = get_warm_size(0);
-	
-	nr_fmem_free = get_num_pages(&f_pages[FASTMEM]);
-	nr_fmem_cold = get_num_pages(&cold_pages[0][FASTMEM]);
-	target_promote = min(nr_fmem_free + nr_fmem_cold, get_num_pages(&hot_pages[0][SLOWMEM]));
-	target_demote = max(0, target_promote - nr_fmem_free);
-	if (warm_size >= 0)  { 
-		if (nr_fmem_cold < warm_size)
-			target_promote_cold = warm_size - nr_fmem_cold;
-		if (nr_fmem_cold - target_demote > warm_size)
-			target_demote = nr_fmem_cold - warm_size;
+	struct list_head promote_pages[NR_HOTNESS_TYPES];
+	struct list_head demote_pages[NR_HOTNESS_TYPES];
+	int target_promote[NR_HOTNESS_TYPES], target_demote[NR_HOTNESS_TYPES]; 
+	int i;
+
+	for (i = 0; i < NR_HOTNESS_TYPES; i++) {
+		INIT_LIST_HEAD(&promote_pages[i]);
+		INIT_LIST_HEAD(&demote_pages[i]);
+
 	}
-	
-	if (target_promote > mtat_migration_rate/2)
-		target_promote = mtat_migration_rate/2;
-	if (target_demote > mtat_migration_rate/2)
-		target_demote = mtat_migration_rate/2;
 
-	nr_promote = isolate_mtat_pages(&hot_pages[0][SLOWMEM], &promote_pages, target_promote);
-	nr_promote += isolate_mtat_pages(&cold_pages[0][SLOWMEM], &promote_pages_cold, target_promote_cold);
-	nr_demote = isolate_mtat_pages(&cold_pages[0][FASTMEM], &demote_pages, target_demote);
+	calculate_migration_target_size(target_promote, target_demote, 0, set_lc_dram_size);
 
-	nr_demote = migrate_page_list(&demote_pages, SLOWMEM, pids[0], COLD);
-	nr_promote = migrate_page_list(&promote_pages, FASTMEM, pids[0], HOT);
-	nr_promote += migrate_page_list(&promote_pages_cold, FASTMEM, pids[0], COLD);
+	for (i = 0; i < NR_HOTNESS_TYPES; i++) {
+		isolate_mtat_pages(&mtat_pages[i][0][SLOWMEM], &promote_pages[i], target_promote[i]);
+		isolate_mtat_pages(&mtat_pages[i][0][FASTMEM], &demote_pages[i], target_demote[i]);
+	}
+
+	for (i = NR_HOTNESS_TYPES-1; i >= 0; i--) 
+		migrate_page_list(&demote_pages[i], SLOWMEM, pids[0], i);
+
+	for (i = 0; i < NR_HOTNESS_TYPES; i++)
+		migrate_page_list(&promote_pages[i], FASTMEM, pids[0], i);	
 }
 
 /*
@@ -1198,117 +1262,42 @@ static void solorun_migration(void)
  */
 static void corun_migration(void)
 {
-	struct list_head promote_pages[2][2]; // [lc/be]
-	struct list_head demote_pages[2][2]; // [lc/be]
+	struct list_head promote_pages[2][NR_HOTNESS_TYPES]; // [lc/be]
+	struct list_head demote_pages[2][NR_HOTNESS_TYPES]; // [lc/be]
 	const int lc = 0, be = 1;
-	int nr_fmem_free;
-	int nr_fmem_hot[2], nr_fmem_cold[2]; // [lc/be]
-	int nr_smem_hot[2], nr_smem_cold[2]; // [lc/be]
-	int target_promote[2][2], target_demote[2][2]; // [lc/be][HOT/COLD]
-	int total_promote = 0, total_demote = 0;
-	int nr_promote[2], nr_demote[2]; // [lc/be]
+	int lc_target_promote[NR_HOTNESS_TYPES], lc_target_demote[NR_HOTNESS_TYPES]; 
+	int be_target_promote[NR_HOTNESS_TYPES], be_target_demote[NR_HOTNESS_TYPES]; 
 	int i, j;
-	uint64_t warm_size;
-
-	warm_size = get_warm_size(0);
 
 	for (i = 0; i < 2; i++) {
-		for (j = 0; j < 2; j++) {
-			target_promote[i][j] = 0;
-			target_demote[i][j] = 0;
+		for (j = 0; j < NR_HOTNESS_TYPES; j++) {
 			INIT_LIST_HEAD(&promote_pages[i][j]);
 			INIT_LIST_HEAD(&demote_pages[i][j]);
 		}
 	}
 
-	nr_fmem_free = get_num_pages(&f_pages[FASTMEM]);
-	for (i = 0; i < 2; i++) {
-		nr_fmem_hot[i] = get_num_pages(&hot_pages[i][FASTMEM]);
-		nr_fmem_cold[i] = get_num_pages(&cold_pages[i][FASTMEM]);
-		nr_smem_hot[i] = get_num_pages(&hot_pages[i][SLOWMEM]);
-		nr_smem_cold[i] = get_num_pages(&cold_pages[i][SLOWMEM]);
-	}
-
-	/* Calculate target_promote, target_demote size for LC */
-	target_promote[lc][HOT] = min(nr_fmem_free + nr_fmem_cold[lc] + nr_fmem_cold[be],
-				get_num_pages(&hot_pages[lc][SLOWMEM]));
-	target_demote[lc][COLD] = max(0, target_promote[lc][HOT] - nr_fmem_free - nr_fmem_cold[be]);
-
-	if (warm_size >= 0) {
-		int lc_remain_cold = nr_fmem_cold[lc] - target_demote[lc][COLD];
-		if (lc_remain_cold > warm_size) {
-			target_demote[lc][COLD] = nr_fmem_cold[lc] - warm_size;
-		} else if (lc_remain_cold < warm_size) {
-			int leftover = warm_size - lc_remain_cold;
-			if (leftover <= target_demote[lc][COLD])
-				target_demote[lc][COLD] -= leftover;
-			else {
-				target_promote[lc][COLD] = target_demote[lc][COLD] + leftover;
-				target_demote[lc][COLD] = 0;
-			}
-		}
-	}
-
-	/* Calculate target_promote, target_demote size for BE */
-	int be_fmem_size = nr_fmem_free + nr_fmem_hot[be] + nr_fmem_cold[be];
-	int fmem_for_be = be_fmem_size - target_promote[lc][HOT] 
-		- target_promote[lc][COLD] + target_demote[lc][COLD];
-	if (be_fmem_size > fmem_for_be) {
-		int leftover = be_fmem_size - fmem_for_be;
-		target_demote[be][COLD] = min(leftover, nr_fmem_cold[be]);
-		target_promote[be][HOT] = max(0, leftover - target_demote[be][COLD]);
-	} else if (be_fmem_size < fmem_for_be) {
-		int leftover = fmem_for_be - be_fmem_size;
-		target_promote[be][HOT] = min(leftover, nr_smem_hot[be]);
-		target_promote[be][COLD] = max(0, leftover - target_promote[be][HOT]);
-	}
-
-	// migration rate limit
-	for (i = 0; i < 2; i++) {
-		total_promote += target_promote[i][HOT] + target_promote[i][COLD];
-		total_demote += target_demote[i][HOT] + target_demote[i][COLD];
-	}
-	if (total_promote + total_demote > mtat_migration_rate) {
-		for (i = 1; i >=0; i--) {
-			for (j = 1; j >= 0; j--) {
-				total_promote -= target_promote[i][j];
-				target_promote[i][j] = 0;
-				if (total_promote < mtat_migration_rate/2) {
-					target_promote[i][j] = mtat_migration_rate/2 - total_promote;
-					total_promote = mtat_migration_rate/2;
-				}
-				total_demote -= target_demote[i][j];
-				target_demote[i][j] = 0;
-				if (total_demote < mtat_migration_rate/2) {
-					target_demote[i][j] = mtat_migration_rate/2 - total_demote;
-					total_demote = mtat_migration_rate/2;
-				}
-
-			}
-		}
-	}
+	calculate_migration_target_size(lc_target_promote, lc_target_demote, 0, set_lc_dram_size);
+	calculate_migration_target_size(be_target_promote, be_target_demote, 1, 
+									total_dram_pages - set_lc_dram_size);
 
 	/* Isolate pages for migration */
-	for (i = 0; i < 2; i++) {
-		nr_promote[i] = isolate_mtat_pages(&hot_pages[i][SLOWMEM], 
-					&promote_pages[i][HOT], target_promote[i][HOT]);
-		nr_promote[i] += isolate_mtat_pages(&cold_pages[i][SLOWMEM], 
-					&promote_pages[i][COLD], target_promote[i][COLD]);
-		nr_demote[i] = isolate_mtat_pages(&hot_pages[i][FASTMEM], 
-					&demote_pages[i][HOT], target_demote[i][HOT]);
-		nr_demote[i] += isolate_mtat_pages(&cold_pages[i][FASTMEM], 
-					&demote_pages[i][COLD], target_demote[i][COLD]);
+	for (i = 0; i < NR_HOTNESS_TYPES; i++) {
+		isolate_mtat_pages(&mtat_pages[i][be][SLOWMEM], &promote_pages[be][i], be_target_promote[i]);
+		isolate_mtat_pages(&mtat_pages[i][be][FASTMEM], &demote_pages[be][i], be_target_demote[i]);
+
+		isolate_mtat_pages(&mtat_pages[i][lc][SLOWMEM], &promote_pages[lc][i], lc_target_promote[i]);
+		isolate_mtat_pages(&mtat_pages[i][lc][FASTMEM], &demote_pages[lc][i], lc_target_demote[i]);
 	}
 
 	/* Do Migration */
-	migrate_page_list(&demote_pages[be][COLD], SLOWMEM, pids[be], COLD);
-	migrate_page_list(&demote_pages[be][HOT], SLOWMEM, pids[be], HOT);
-	migrate_page_list(&demote_pages[lc][COLD], SLOWMEM, pids[lc], COLD);
-	migrate_page_list(&demote_pages[lc][HOT], SLOWMEM, pids[lc], HOT);
-	migrate_page_list(&promote_pages[lc][HOT], FASTMEM, pids[lc], HOT);
-	migrate_page_list(&promote_pages[lc][COLD], FASTMEM, pids[lc], COLD);
-	migrate_page_list(&promote_pages[be][HOT], FASTMEM, pids[be], HOT);
-	migrate_page_list(&promote_pages[be][COLD], FASTMEM, pids[be], COLD);
+	for (i = NR_HOTNESS_TYPES-1; i >= 0; i--) {
+		migrate_page_list(&demote_pages[be][i], SLOWMEM, pids[be], i);
+		migrate_page_list(&demote_pages[lc][i], SLOWMEM, pids[lc], i);
+	}
+	for (i = 0; i < NR_HOTNESS_TYPES; i++) {
+		migrate_page_list(&promote_pages[lc][i], FASTMEM, pids[lc], i);	
+		migrate_page_list(&promote_pages[be][i], FASTMEM, pids[be], i);	
+	}
 }
 
 static void do_migration(void)
@@ -1323,22 +1312,35 @@ static void do_migration(void)
 	}
 }
 
+static void update_histogram(void)
+{
+	hg_update_hot_threshold(0, set_lc_dram_size);
+	if (MTAT_MIGRATION_MODE == CORUN)
+		hg_update_hot_threshold(1, total_dram_pages - set_lc_dram_size);
+}
+
 static int kmigrated_main(void *data)
 {
 	int loop = 0;
+	int i, tmp;
 	pr_info("kmigrated start\n");
 
 	mtat_set_cpu_affinity(KMIGRATED_CPU);
 
 	while (!kthread_should_stop()) {
+		update_histogram();
+
 		if (migrate_on) {
 			do_migration();
 		}
 
-		lc_dram_pages = get_num_pages(&hot_pages[0][FASTMEM]) 
-			+ get_num_pages(&cold_pages[0][FASTMEM]);
-		lc_total_pages = get_num_pages(&hot_pages[0][SLOWMEM]) 
-			+ get_num_pages(&cold_pages[0][SLOWMEM]) + lc_dram_pages;
+		lc_dram_pages = 0;
+		lc_total_pages = 0;
+		for (i = 0; i < NR_HOTNESS_TYPES; i++) {
+			tmp = get_num_pages(&mtat_pages[i][0][FASTMEM]);
+			lc_dram_pages += tmp;
+			lc_total_pages += tmp + get_num_pages(&mtat_pages[i][0][SLOWMEM]);
+		}
 
 		if (loop * mtat_migration_period >= cooling_period) {
 			loop = 0;
@@ -1371,13 +1373,6 @@ int init_module(void)
 		pr_info("failed to create sysfs entry for lc_hg\n");
 		return -1;
 	}
-
-
-	pr_info("hg_get_idx(0): %llu\n", hg_get_idx(0));
-	pr_info("hg_get_idx(1): %llu\n", hg_get_idx(1));
-	pr_info("hg_get_accesses(0): %llu\n", hg_get_accesses(0));
-	pr_info("hg_get_accesses(1): %llu\n", hg_get_accesses(1));
-	pr_info("hg_get_accesses(2): %llu\n", hg_get_accesses(2));
 
 	build_page_list();
 

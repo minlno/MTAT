@@ -23,7 +23,8 @@
 
 enum hotness_types {
 	HOT = 0,
-	COLD = 1,
+	WARM = 1,
+	COLD = 2,
 	NR_HOTNESS_TYPES
 };
 
@@ -34,8 +35,8 @@ struct access_histogram {
 	spinlock_t lock;
 
 	uint64_t nr_sampled;
-	uint64_t warm_size;
 	uint64_t hot_threshold;
+	uint64_t warm_threshold;
 };
 
 // physical page를 나타냄.
