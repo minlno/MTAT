@@ -107,7 +107,7 @@ static uint64_t perf_virt_to_phys(u64 virt, pid_t pid)
 	put_pid(pid_struct);
 
 	if (!tsk) {
-		pr_info("no tsk struct\n");
+		//pr_info("no tsk struct\n");
 		return 0;
 	}
 
@@ -124,7 +124,8 @@ static uint64_t perf_virt_to_phys(u64 virt, pid_t pid)
 			pagefault_disable();
 			if (get_user_pages_remote(tsk->mm, virt, 1, 0, &p, NULL, NULL)) {
 				if (p) {
-					phys_addr = (page_to_pfn(p) << PAGE_SHIFT) + virt % PAGE_SIZE;
+					phys_addr = (page_to_pfn(p) << PAGE_SHIFT);
+					//phys_addr = (page_to_pfn(p) << PAGE_SHIFT) + virt % PAGE_SIZE;
 					put_page(p);
 				}
 			}
@@ -396,7 +397,8 @@ static void print_debug_stats(void)
 	spin_unlock(&debug_lock);
 
 	pr_info("---------------------------------------\n");
-	pr_info("nr_sampled: \n");
+	pr_info("nr_sampled: %llu\n", tmp_nr_sampled[0] + tmp_nr_sampled[1] 
+								+ tmp_nr_sampled[2] + tmp_nr_sampled[3]);
 	pr_info("----DRAM_READ: %llu\n", tmp_nr_sampled[0]);
 #ifdef CXL_MODE
 	pr_info("----CXL_READ: %llu\n", tmp_nr_sampled[2]);
@@ -406,6 +408,7 @@ static void print_debug_stats(void)
 	pr_info("----STORE_ALL: %llu\n", tmp_nr_sampled[3]);
 	pr_info("nr_found: %llu\n", tmp_nr_found);
 	pr_info("nr_not_found: %llu\n", tmp_nr_not_found);
+	pr_info("nr_found + nr_not_found: %llu\n", tmp_nr_found + tmp_nr_not_found);
 	pr_info("nr_throttled: %llu\n", tmp_nr_throttled);
 	pr_info("nr_losted: %llu\n", tmp_nr_losted);
 	pr_info("nr_cooled: %llu\n", tmp_nr_cooled);
@@ -444,8 +447,11 @@ static size_t configs[] = { DRAM_READ, CXL_READ, STORE_ALL };
 static size_t configs[] = { DRAM_READ, PMEM_READ, STORE_ALL };
 #endif
 
-static size_t cpus[] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,
-					   48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71};
+static size_t cpus[] = {16,17,18,19,20,21,22,23};
+					   //48,49,50,51,52,53,54,55,56,57,58,59};
+					   //64,65,66,67,68,69,70,71};
+//static size_t cpus[] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,
+//					   48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71};
 //static size_t cpus[] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23};
 //static size_t cpus[] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,
 //						25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48};
@@ -707,7 +713,7 @@ static int kpebsd_main(void *data)
 	struct perf_event_mmap_page *p;
 	struct perf_event_header *ph;
 	struct perf_sample *ps;
-	char *pbuf;
+	//char *pbuf;
 	size_t idx, config, cpu, i, ncpus = ARRAY_SIZE(cpus);
 	uint64_t pfn, pg_index, offset;
 	int page_shift;
@@ -772,12 +778,10 @@ static int kpebsd_main(void *data)
 						debug_nr_sampled[3]++;
 					spin_unlock(&debug_lock);
 
-					/*
 					if (cpu != ps->cpu) {
-						pr_info("current cpu: %u\n", cpu);
-						pr_info("sampled cpu: %u\n", ps->cpu);
+						//pr_info("current v.s. sample: %lu, %u\n", cpu, ps->cpu);
+						break;
 					}
-					*/
 
 					pfn = perf_virt_to_phys(ps->addr, ps->pid) >> HPAGE_SHIFT;
 					pebs_sample(pfn);
@@ -809,21 +813,20 @@ static int kpebsd_main(void *data)
 static void pebs_start(void)
 {
 	size_t idx, config, i, cpu, ncpus = ARRAY_SIZE(cpus);
-	static struct perf_event_attr wd_hw_attr = {
-		.type = PERF_TYPE_RAW,
-		.size = sizeof(struct perf_event_attr),
-		//.pinned = 0,
-		.disabled = 0,
-		.precise_ip = 1,
-		//.sample_id_all = 1,
-		.exclude_kernel = 1,
-		.exclude_guest = 1,
-		.exclude_hv = 1,
-		.exclude_callchain_kernel = 1,
-		.exclude_callchain_user = 1,
-		.exclude_user = 0,
-		.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_ADDR | PERF_SAMPLE_CPU,
-	};
+	static struct perf_event_attr perf_attr;
+
+	memset(&perf_attr, 0, sizeof(struct perf_event_attr));
+
+	perf_attr.type = PERF_TYPE_RAW;
+	perf_attr.size = sizeof(struct perf_event_attr);
+	perf_attr.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_ADDR | PERF_SAMPLE_CPU;
+	perf_attr.disabled = 0;
+	perf_attr.exclude_kernel = 1;
+	perf_attr.exclude_hv = 1;
+	perf_attr.exclude_callchain_kernel = 1;
+	perf_attr.exclude_callchain_user = 1;
+	perf_attr.precise_ip = 1;
+	perf_attr.enable_on_exec = 1;
 
 	events = vmalloc(ncpus * ARRAY_SIZE(configs) * sizeof(*events));
 	if (!events) {
@@ -835,10 +838,10 @@ static void pebs_start(void)
 		for (i = 0; i < ARRAY_SIZE(cpus); i++) {
 			cpu = cpus[i];
 			idx = config * ncpus + cpu;
-			wd_hw_attr.config = configs[config];
-			wd_hw_attr.sample_period = SAMPLE_PERIOD_PEBS;
+			perf_attr.config = configs[config];
+			perf_attr.sample_period = SAMPLE_PERIOD_PEBS;
 			events[idx] = 
-				perf_event_create_kernel_counter(&wd_hw_attr,
+				perf_event_create_kernel_counter(&perf_attr,
 						cpu, NULL, NULL, NULL);
 			if (IS_ERR(events[idx])) {
 				pr_err("Failed to create event %lu on cpu %lu\n", configs[config], cpu);
@@ -1321,7 +1324,6 @@ static void update_histogram(void)
 
 static int kmigrated_main(void *data)
 {
-	int loop = 0;
 	int i, tmp;
 	pr_info("kmigrated start\n");
 
@@ -1342,18 +1344,32 @@ static int kmigrated_main(void *data)
 			lc_total_pages += tmp + get_num_pages(&mtat_pages[i][0][SLOWMEM]);
 		}
 
-		if (loop * mtat_migration_period >= cooling_period) {
-			loop = 0;
-			partial_cooling();
-		} else {
-			loop++;
-		}
-
 		msleep(mtat_migration_period);
 		if (need_resched())
 			schedule();
 	}
 	pr_info("kmigrated exit\n");
+	return 0;
+}
+
+/*
+ * Cooling daemon
+ */
+static struct task_struct *kcoolingd;
+
+static int kcoolingd_main(void *data)
+{
+	pr_info("kcoolingd start\n");
+
+	mtat_set_cpu_affinity(KMIGRATED_CPU);
+
+	while (!kthread_should_stop()) {
+		partial_cooling();
+		msleep(cooling_period);
+		if (need_resched())
+			schedule();
+	}
+	pr_info("kcoolingd exit\n");
 	return 0;
 }
 
@@ -1391,6 +1407,11 @@ int init_module(void)
 		pr_err("Failed to create kmigrated\n");
 	}
 
+	kcoolingd = kthread_run(kcoolingd_main, NULL, "kcoolingd");
+	if (IS_ERR(kcoolingd)) {
+		pr_err("Failed to create kcoolingd\n");
+	}
+
 	pr_info("Successfully insert MTAT module\n");
 	return 0;
 }
@@ -1400,6 +1421,8 @@ int init_module(void)
  */
 void cleanup_module(void)
 {
+	if (kcoolingd)
+		kthread_stop(kcoolingd);
 	if (kmigrated)
 		kthread_stop(kmigrated);
 	if (kdebugd)

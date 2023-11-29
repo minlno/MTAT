@@ -85,7 +85,7 @@ struct perf_sample {
 #define CXL_READ 0x02d3 // CXL
 #define DRAM_READ 0x01d3
 #define STORE_ALL 0x82d0
-#define SAMPLE_PERIOD_PEBS 5003 // 10007
+#define SAMPLE_PERIOD_PEBS 1007 // 10007 5003
 #define KPEBSD_CPU 4
 
 /*
