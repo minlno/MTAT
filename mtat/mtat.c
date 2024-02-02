@@ -60,6 +60,7 @@ module_param(total_dram_pages, int, S_IRUSR | S_IRGRP | S_IROTH);
 /*
  * For Debug
  */
+static uint64_t lc_hg[16]; // it is for training LC RL model
 static uint64_t debug_nr_sampled[4];
 static uint64_t debug_nr_skip;
 static uint64_t debug_nr_throttled;
@@ -211,14 +212,16 @@ static ssize_t lc_hg_show(struct kobject *kobj,
 	int i, len = 0, ret;
 	size_t buf_size = PAGE_SIZE;
 
+	spin_lock(&debug_lock);
 	for (i = 0; i < 16; i++) {
-		ret = snprintf(buf + len, buf_size - len, "%llu ", hg[0].hg[i]);
+		ret = snprintf(buf + len, buf_size - len, "%llu ", lc_hg[i]);
 
 		if (ret >= buf_size - len) 
 			break;
 
 		len += ret;
 	}
+	spin_unlock(&debug_lock);
 
 	return len;
 }
@@ -1354,11 +1357,23 @@ static struct task_struct *kcoolingd;
 
 static int kcoolingd_main(void *data)
 {
+	uint64_t tmp_hg[16];
+	int i;
 	pr_info("kcoolingd start\n");
 
 	mtat_set_cpu_affinity(KMIGRATED_CPU);
 
 	while (!kthread_should_stop()) {
+		spin_lock(&hg[0].lock);
+		for (i = 0; i < 16; i++)
+			tmp_hg[i] = hg[0].hg[i];
+		spin_unlock(&hg[0].lock);
+
+		spin_lock(&debug_lock);
+		for (i = 0; i < 16; i++)
+			lc_hg[i] = tmp_hg[i];
+		spin_unlock(&debug_lock);
+
 		partial_cooling();
 		msleep(cooling_period);
 		if (need_resched())
