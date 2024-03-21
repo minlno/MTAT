@@ -20,6 +20,14 @@
 
 #define PID_NONE -1
 #define MAX_PIDS 8
+enum app_types {
+	LC = 0,
+	BE = 1,
+	NR_APP_TYPES
+};
+struct app_struct {
+	int pid;
+};
 
 enum hotness_types {
 	HOT = 0,

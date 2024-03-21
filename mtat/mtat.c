@@ -61,6 +61,10 @@ module_param(total_dram_pages, int, S_IRUSR | S_IRGRP | S_IROTH);
  * For Debug
  */
 static uint64_t lc_hg[16]; // it is for training LC RL model
+static uint64_t lc_nr_sampled; // it is for training LC RL model
+static uint64_t lc_nr_read; // it is for training LC RL model
+static uint64_t lc_nr_dram_read; // it is for training LC RL model
+static uint64_t lc_nr_smem_read; // it is for training LC RL model
 static uint64_t debug_nr_sampled[4];
 static uint64_t debug_nr_skip;
 static uint64_t debug_nr_throttled;
@@ -226,6 +230,66 @@ static ssize_t lc_hg_show(struct kobject *kobj,
 	return len;
 }
 static struct kobj_attribute lc_hg_attr = __ATTR_RO(lc_hg);
+
+static ssize_t lc_nr_sampled_show(struct kobject *kobj,
+					struct kobj_attribute *attr, char *buf)
+{
+	int i, len = 0, ret;
+
+	spin_lock(&debug_lock);
+
+	len = snprintf(buf, PAGE_SIZE, "%llu", lc_nr_sampled);
+
+	spin_unlock(&debug_lock);
+
+	return len;
+}
+static struct kobj_attribute lc_nr_sampled_attr = __ATTR_RO(lc_nr_sampled);
+
+static ssize_t lc_nr_read_show(struct kobject *kobj,
+					struct kobj_attribute *attr, char *buf)
+{
+	int i, len = 0, ret;
+
+	spin_lock(&debug_lock);
+
+	len = snprintf(buf, PAGE_SIZE, "%llu", lc_nr_read);
+
+	spin_unlock(&debug_lock);
+
+	return len;
+}
+static struct kobj_attribute lc_nr_read_attr = __ATTR_RO(lc_nr_read);
+
+static ssize_t lc_nr_dram_read_show(struct kobject *kobj,
+					struct kobj_attribute *attr, char *buf)
+{
+	int i, len = 0, ret;
+
+	spin_lock(&debug_lock);
+
+	len = snprintf(buf, PAGE_SIZE, "%llu", lc_nr_dram_read);
+
+	spin_unlock(&debug_lock);
+
+	return len;
+}
+static struct kobj_attribute lc_nr_dram_read_attr = __ATTR_RO(lc_nr_dram_read);
+
+static ssize_t lc_nr_smem_read_show(struct kobject *kobj,
+					struct kobj_attribute *attr, char *buf)
+{
+	int i, len = 0, ret;
+
+	spin_lock(&debug_lock);
+
+	len = snprintf(buf, PAGE_SIZE, "%llu", lc_nr_smem_read);
+
+	spin_unlock(&debug_lock);
+
+	return len;
+}
+static struct kobj_attribute lc_nr_smem_read_attr = __ATTR_RO(lc_nr_smem_read);
 
 /*
  * Page list related variables and functions
@@ -400,6 +464,12 @@ static void print_debug_stats(void)
 	debug_nr_throttled = 0;
 	debug_nr_losted = 0;
 	debug_nr_skip = 0;
+
+	lc_nr_sampled = tmp_nr_sampled[0] + tmp_nr_sampled[1] 
+					+ tmp_nr_sampled[2] + tmp_nr_sampled[3];
+	lc_nr_read = tmp_nr_sampled[0] + tmp_nr_sampled[1] + tmp_nr_sampled[2];
+	lc_nr_dram_read = tmp_nr_sampled[0];
+	lc_nr_smem_read = tmp_nr_sampled[1] + tmp_nr_sampled[2];
 
 	spin_unlock(&debug_lock);
 
@@ -1401,7 +1471,22 @@ int init_module(void)
 		pr_info("failed to create sysfs entry for lc_hg\n");
 		return -1;
 	}
-
+	if (sysfs_create_file(kernel_kobj, &lc_nr_sampled_attr.attr)) {
+		pr_info("failed to create sysfs entry for lc_nr_sampled\n");
+		return -1;
+	}
+	if (sysfs_create_file(kernel_kobj, &lc_nr_read_attr.attr)) {
+		pr_info("failed to create sysfs entry for lc_nr_read\n");
+		return -1;
+	}
+	if (sysfs_create_file(kernel_kobj, &lc_nr_dram_read_attr.attr)) {
+		pr_info("failed to create sysfs entry for lc_nr_dram_read\n");
+		return -1;
+	}
+	if (sysfs_create_file(kernel_kobj, &lc_nr_smem_read_attr.attr)) {
+		pr_info("failed to create sysfs entry for lc_nr_smem_read\n");
+		return -1;
+	}
 	build_page_list();
 
 	set_dequeue_hook(mtat_allocate_page);
@@ -1452,6 +1537,10 @@ void cleanup_module(void)
 	destroy_hashtable();
 	
 	sysfs_remove_file(kernel_kobj, &lc_hg_attr.attr);
+	sysfs_remove_file(kernel_kobj, &lc_nr_sampled_attr.attr);
+	sysfs_remove_file(kernel_kobj, &lc_nr_read_attr.attr);
+	sysfs_remove_file(kernel_kobj, &lc_nr_dram_read_attr.attr);
+	sysfs_remove_file(kernel_kobj, &lc_nr_smem_read_attr.attr);
 
 	pr_info("Remove MTAT module\n");
 }
