@@ -14,66 +14,76 @@ static int FASTMEM;
 static int SLOWMEM;
 #define NR_MEM_TYPES 3
 
+// ms, cooling_period는 mtat manager의 정책 결정 주기와 동일해야함.
+static unsigned long cooling_period = 1000; 
+static unsigned long mtat_migration_period = 1; // ms
+static unsigned long min_hot_threshold = 1;
+
 /*
- * Module parameters
+ * Sysfs parameters
  */
-static int migrate_on = 0;
-module_param(migrate_on, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-static int pebs_on = 1;
-module_param(pebs_on, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-
-static int min_hot_threshold = 1;
-module_param(min_hot_threshold, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-static int set_lc_dram_size = 0; // 2MB page 개수 -1이 아닌경우 무조건 이값으로 warm size를 유지
-module_param(set_lc_dram_size, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-
-static int cooling_period = 1000; // ms
-module_param(cooling_period, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-static int zero_cooling_on = 0;
-module_param(zero_cooling_on, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+struct mtat_sysfs_ui_dir *mtat_sysfs;
+static int mtat_sysfs_apps_dir_add_dirs(struct mtat_sysfs_apps_dir *apps_dir, int app_idx);
+static unsigned long migrate_on = 0;
+static unsigned long pebs_on = 1;
+static unsigned long mtat_debug_on = 1;
+static unsigned long total_dram_pages = 0; // 2MB pages
 
 /*
-static int min_warm_size = 1000; // 2MB page 개수
-module_param(min_warm_size, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-static int warm_percent = 50; // %
-module_param(warm_percent, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-static int static_warm_size = -1; // 2MB page 개수 -1이 아닌경우 무조건 이값으로 warm size를 유지
-module_param(static_warm_size, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-*/
-
-static int mtat_debug_on = 1;
-module_param(mtat_debug_on, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-
-static int mtat_migration_rate = 5000; // 2MB page 개수
-module_param(mtat_migration_rate, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-static int mtat_migration_period = 1; // ms
-module_param(mtat_migration_period, int, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-
-static int lc_dram_pages = -1; // 2MB pages
-module_param(lc_dram_pages, int, S_IRUSR | S_IRGRP | S_IROTH);
-static int lc_total_pages = -1; // 2MB pages
-module_param(lc_total_pages, int, S_IRUSR | S_IRGRP | S_IROTH);
-static int total_dram_pages = -1; // 2MB pages
-module_param(total_dram_pages, int, S_IRUSR | S_IRGRP | S_IROTH);
-
-
-/*
- * For Debug
+ * app_struct related variables
  */
-static uint64_t lc_hg[16]; // it is for training LC RL model
-static uint64_t lc_nr_sampled; // it is for training LC RL model
-static uint64_t lc_nr_read; // it is for training LC RL model
-static uint64_t lc_nr_dram_read; // it is for training LC RL model
-static uint64_t lc_nr_smem_read; // it is for training LC RL model
-static uint64_t debug_nr_sampled[4];
-static uint64_t debug_nr_skip;
-static uint64_t debug_nr_throttled;
-static uint64_t debug_nr_found;
-static uint64_t debug_nr_not_found;
-static uint64_t debug_nr_losted;
-static uint64_t debug_nr_cooled;
-static uint64_t debug_nr_migrated;
-static spinlock_t debug_lock;
+static struct app_struct apps[MAX_APPS];
+
+/*
+ * Page list related variables
+ *
+ * lock 규칙:
+ * - list_del, list_add 모두 mtat_page->lock,  page_list->lock 잡은 후 수행.
+ *
+ * lock 순서:
+ * total_pages_lock
+ *  mtat_page->lock
+ *   app->lock, hg->lock, debug->lock, mtat_pages->lock
+ */
+static struct list_head total_pages[MAX_APPS]; // for cooling
+static spinlock_t total_pages_lock[MAX_APPS];
+static struct page_list f_pages[NR_MEM_TYPES]; // free_pages
+static struct page_list mtat_pages[NR_HOTNESS_TYPES][MAX_APPS][NR_MEM_TYPES];
+
+/*
+ * Hashtable for mtat_page management
+ */
+static struct rhashtable *hashtable = NULL;
+static struct rhashtable_params params = {
+	.head_offset = offsetof(struct mtat_page, node),
+	.key_offset = offsetof(struct mtat_page, pfn),
+	.key_len = sizeof(uint64_t),
+	.automatic_shrinking = false,
+	.min_size = 0xffff,
+};
+
+static struct task_struct *kdebugd;
+static struct task_struct *kpebsd;
+static struct task_struct *kmigrated;
+static struct task_struct *kcoolingd;
+
+static struct perf_event ***events;
+static int **events_fd;
+
+#ifdef CXL_MODE
+static size_t configs[] = { DRAM_READ, CXL_READ, STORE_ALL };
+#else
+static size_t configs[] = { DRAM_READ, PMEM_READ, STORE_ALL };
+#endif
+
+static size_t cpus[] = {16,17,18,19,20,21,22,23,
+					   48,49,50,51,52,53,54,55,56,57,58,59,
+					   64,65,66,67,68,69,70,71};
+//static size_t cpus[] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,
+//					   48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71};
+//static size_t cpus[] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23};
+//static size_t cpus[] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,
+//						25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48};
 
 /*
  * Util funtions
@@ -144,20 +154,11 @@ static uint64_t perf_virt_to_phys(u64 virt, pid_t pid)
 /*
  * Access Histogram
  */
-static struct access_histogram hg[MAX_PIDS];
-static struct list_head total_pages[MAX_PIDS];
-static spinlock_t total_pages_lock[MAX_PIDS];
-
-static void init_hg(void)
+static void init_hg(struct access_histogram *hg)
 {
-	int i;
-	for (i = 0; i < MAX_PIDS; i++) {
-		spin_lock_init(&hg[i].lock);
-		hg[i].hot_threshold = min_hot_threshold;
-		hg[i].warm_threshold = min_hot_threshold - 1;
-
-		hg[i].nr_sampled = 0;
-	}
+	hg->hot_threshold = min_hot_threshold;
+	hg->warm_threshold = min_hot_threshold - 1;
+	spin_lock_init(&hg->lock);
 }
 
 static uint64_t hg_get_idx(uint64_t num)
@@ -186,113 +187,50 @@ static uint64_t hg_get_accesses(uint64_t idx)
 	return accesses;
 }
 
-// hg lock 잡지 않고 호출해야함.
-static void hg_update_hot_threshold(uint64_t hg_idx, uint64_t dram_size)
+static void hg_update_hot_threshold(struct access_histogram *hg, uint64_t dram_size)
 {
 	uint64_t tmp = 0;
 	int i;
 
-	spin_lock(&hg[hg_idx].lock);
+	spin_lock(&hg->lock);
 	for (i = 15; i >= 0; i--) {
-		tmp += hg[hg_idx].hg[i];
+		tmp += hg->histogram[i];
 		if (tmp > dram_size) {
-			hg[hg_idx].hot_threshold = i+1;
-			hg[hg_idx].warm_threshold = i;
-			spin_unlock(&hg[hg_idx].lock);
+			hg->hot_threshold = i+1;
+			hg->warm_threshold = i;
+			spin_unlock(&hg->lock);
 			return;
 		}
 	}
-	hg[hg_idx].hot_threshold = min_hot_threshold;
-	hg[hg_idx].warm_threshold = min_hot_threshold - 1;
-	spin_unlock(&hg[hg_idx].lock);
+	hg->hot_threshold = min_hot_threshold;
+	hg->warm_threshold = min_hot_threshold - 1;
+	spin_unlock(&hg->lock);
 }
 
 /*
- * Histogram Sysfs
+ * app_struct related functions
  */
-static ssize_t lc_hg_show(struct kobject *kobj,
-					struct kobj_attribute *attr, char *buf)
+static void init_debug(struct mtat_debug_info *debug)
 {
-	int i, len = 0, ret;
-	size_t buf_size = PAGE_SIZE;
+	spin_lock_init(&debug->lock);
+}
 
-	spin_lock(&debug_lock);
-	for (i = 0; i < 16; i++) {
-		ret = snprintf(buf + len, buf_size - len, "%llu ", lc_hg[i]);
+// TODO: app_struct에 추가한거 확인하고 반영하기
+static void init_apps(void)
+{
+	int i;
 
-		if (ret >= buf_size - len) 
-			break;
+	for (i = 0; i < MAX_APPS; i++) {
+		apps[i].pid = PID_NONE;
+		spin_lock_init(&apps[i].lock);
 
-		len += ret;
+		init_debug(&apps[i].debug);
+		init_hg(&apps[i].hg);
 	}
-	spin_unlock(&debug_lock);
-
-	return len;
 }
-static struct kobj_attribute lc_hg_attr = __ATTR_RO(lc_hg);
-
-static ssize_t lc_nr_sampled_show(struct kobject *kobj,
-					struct kobj_attribute *attr, char *buf)
-{
-	int i, len = 0, ret;
-
-	spin_lock(&debug_lock);
-
-	len = snprintf(buf, PAGE_SIZE, "%llu", lc_nr_sampled);
-
-	spin_unlock(&debug_lock);
-
-	return len;
-}
-static struct kobj_attribute lc_nr_sampled_attr = __ATTR_RO(lc_nr_sampled);
-
-static ssize_t lc_nr_read_show(struct kobject *kobj,
-					struct kobj_attribute *attr, char *buf)
-{
-	int i, len = 0, ret;
-
-	spin_lock(&debug_lock);
-
-	len = snprintf(buf, PAGE_SIZE, "%llu", lc_nr_read);
-
-	spin_unlock(&debug_lock);
-
-	return len;
-}
-static struct kobj_attribute lc_nr_read_attr = __ATTR_RO(lc_nr_read);
-
-static ssize_t lc_nr_dram_read_show(struct kobject *kobj,
-					struct kobj_attribute *attr, char *buf)
-{
-	int i, len = 0, ret;
-
-	spin_lock(&debug_lock);
-
-	len = snprintf(buf, PAGE_SIZE, "%llu", lc_nr_dram_read);
-
-	spin_unlock(&debug_lock);
-
-	return len;
-}
-static struct kobj_attribute lc_nr_dram_read_attr = __ATTR_RO(lc_nr_dram_read);
-
-static ssize_t lc_nr_smem_read_show(struct kobject *kobj,
-					struct kobj_attribute *attr, char *buf)
-{
-	int i, len = 0, ret;
-
-	spin_lock(&debug_lock);
-
-	len = snprintf(buf, PAGE_SIZE, "%llu", lc_nr_smem_read);
-
-	spin_unlock(&debug_lock);
-
-	return len;
-}
-static struct kobj_attribute lc_nr_smem_read_attr = __ATTR_RO(lc_nr_smem_read);
 
 /*
- * Page list related variables and functions
+ * Page list related functions
  *
  * lock 규칙:
  * - list_del, list_add 모두 mtat_page->lock,  page_list->lock 잡은 후 수행.
@@ -300,14 +238,8 @@ static struct kobj_attribute lc_nr_smem_read_attr = __ATTR_RO(lc_nr_smem_read);
  * lock 순서:
  * total_pages_lock
  *  mtat_page->lock
- *   hg->lock, mtat_pages->lock, lock
+ *   app->lock, mtat_pages->lock, lock
  */
-static int pids[MAX_PIDS];
-static spinlock_t lock;
-
-static struct page_list f_pages[NR_MEM_TYPES]; // free_pages
-static struct page_list mtat_pages[NR_HOTNESS_TYPES][MAX_PIDS][NR_MEM_TYPES];
-
 struct mtat_page *alloc_and_init_mtat_page(struct page *page)
 {
 	struct mtat_page *m_page = kmalloc(sizeof(*m_page), GFP_KERNEL);
@@ -319,7 +251,7 @@ struct mtat_page *alloc_and_init_mtat_page(struct page *page)
 	m_page->pfn = page_to_pfn(page) << PAGE_SHIFT >> HPAGE_SHIFT;
 	m_page->accesses = 0;
 	m_page->hotness = COLD;
-	m_page->pids_idx = PID_NONE;
+	m_page->apps_idx = PID_NONE;
 	m_page->nid = page_to_nid(page);
 	m_page->hg_idx = 0;
 	INIT_LIST_HEAD(&m_page->list);
@@ -368,15 +300,6 @@ void init_page_list(struct page_list *pl)
  *  Hashtable for MTAT page management  *
  ****************************************
  */
-static struct rhashtable *hashtable = NULL;
-static struct rhashtable_params params = {
-	.head_offset = offsetof(struct mtat_page, node),
-	.key_offset = offsetof(struct mtat_page, pfn),
-	.key_len = sizeof(uint64_t),
-	.automatic_shrinking = false,
-	.min_size = 0xffff,
-};
-
 static void rh_free_fn(void *ptr, void *arg)
 {
 	struct mtat_page *m_page = ptr;
@@ -414,22 +337,40 @@ static void destroy_hashtable(void)
  * kdebugd thread for debugging *
  **********************************
  */
-static struct task_struct *kdebugd;
+static void print_debug(struct mtat_debug_info *debug)
+{
+	uint64_t total_sampled = 0;
+	int i;
+
+	// Lock 굳이 안잡음. 어차피 눈으로 확인하는 용도라서 값이 좀 틀려도 상관없음.
+	for (i = 0; i < 4; i++)
+		total_sampled = debug->nr_sampled[i];
+	pr_info("total_sampled: %llu\n", total_sampled);
+	pr_info("----DRAM_READ: %llu\n", debug->nr_sampled[0]);
+#ifdef CXL_MODE
+	pr_info("----CXL_READ: %llu\n", debug->nr_sampled[2]);
+#else
+	pr_info("----PMEM_READ: %llu\n", debug->nr_sampled[1]);
+#endif
+	pr_info("----STORE_ALL: %llu\n", debug->nr_sampled[3]);
+	pr_info("nr_found: %llu\n", debug->nr_found);
+	pr_info("nr_cooled: %llu\n", debug->nr_cooled);
+	pr_info("nr_migrated: %llu MB\n", debug->nr_migrated); //TODO
+}
 
 static void print_debug_stats(void)
 {
+	struct app_struct *app;
+	struct mtat_debug_info *debug;
 	int i, j;
-	uint64_t tmp_nr_sampled[4];
-	uint64_t tmp_nr_cooled, tmp_nr_migrated;
-	uint64_t tmp_nr_throttled, tmp_nr_losted;
-	uint64_t tmp_nr_found, tmp_nr_not_found;
-	uint64_t tmp_nr_skip;
 
-	for (i = 0; i < MAX_PIDS; i++) {
-		if (pids[i] == PID_NONE)
-			continue;
-		pr_info("=======================================\n");
-		pr_info("pid: %d\n", pids[i]);
+	pr_info("=======================================\n");
+	for (i = 0; i < MAX_APPS; i++) {
+		app = &apps[i];
+		if (app->pid == PID_NONE)
+			break;
+		pr_info("pid: %d\n", app->pid);
+		debug = &app->debug;
 		for (j = 0; j < NR_MEM_TYPES; j++) {
 			if (j != memory_nodes[0] && j != memory_nodes[1])
 				continue;
@@ -438,61 +379,63 @@ static void print_debug_stats(void)
 			pr_info("----warm_pages: %d\n", get_num_pages(&mtat_pages[WARM][i][j]));
 			pr_info("----cold_pages: %d\n", get_num_pages(&mtat_pages[COLD][i][j]));
 		}
-		// histogram
-		pr_info("nr_sampled: %llu\n", hg[i].nr_sampled);
-		//for (j = 0; j < 16; j++)
-			//pr_info("%d: %llu", j, hg[i].hg[j]);
+		print_debug(debug);
+	}
+}
+
+static void update_debug_stats(void)
+{
+	struct app_struct *app;
+	struct mtat_debug_info *debug;
+	int i, j;
+	int nr_total_sampled, nr_fmem_read, nr_smem_read;
+	for (i = 0; i < MAX_APPS; i++) {
+		app = &apps[i];
+		if (app->pid == PID_NONE) {
+			break;
+		}
+		debug = &app->debug;
+
+		nr_total_sampled = 0;
+		nr_fmem_read = 0;
+		nr_smem_read = 0;
+
+		spin_lock(&debug->lock);
+		for (j = 0; j < 4; j++)
+			nr_total_sampled += debug->nr_sampled[j];
+		nr_fmem_read = debug->nr_sampled[0];
+		nr_smem_read = debug->nr_sampled[1] + debug->nr_sampled[2];
+		spin_unlock(&debug->lock);
+
+		spin_lock(&app->lock);
+		app->nr_total_sampled = nr_total_sampled;
+		app->nr_fmem_read = nr_fmem_read;
+		app->nr_smem_read = nr_smem_read;
+		spin_unlock(&app->lock);
 	}
 
-	spin_lock(&debug_lock);
+}
 
-	for (i = 0; i < 4; i++)
-		tmp_nr_sampled[i] = debug_nr_sampled[i];
-	tmp_nr_found = debug_nr_found;
-	tmp_nr_not_found = debug_nr_not_found;
-	tmp_nr_cooled = debug_nr_cooled;
-	tmp_nr_migrated = debug_nr_migrated;
-	tmp_nr_throttled = debug_nr_throttled;
-	tmp_nr_losted = debug_nr_losted;
-	tmp_nr_skip = debug_nr_skip;
+static void clear_debug_stats(void)
+{
+	struct app_struct *app;
+	struct mtat_debug_info *debug;
+	int i, j;
+	for (i = 0; i < MAX_APPS; i++) {
+		app = &apps[i];
+		if (app->pid == PID_NONE) {
+			break;
+		}
+		debug = &app->debug;
 
-	memset(debug_nr_sampled, 0, sizeof(debug_nr_sampled));
-	debug_nr_found = 0;
-	debug_nr_not_found = 0;
-	debug_nr_cooled = 0;
-	debug_nr_migrated = 0;
-	debug_nr_throttled = 0;
-	debug_nr_losted = 0;
-	debug_nr_skip = 0;
-
-	lc_nr_sampled = tmp_nr_sampled[0] + tmp_nr_sampled[1] 
-					+ tmp_nr_sampled[2] + tmp_nr_sampled[3];
-	lc_nr_read = tmp_nr_sampled[0] + tmp_nr_sampled[1] + tmp_nr_sampled[2];
-	lc_nr_dram_read = tmp_nr_sampled[0];
-	lc_nr_smem_read = tmp_nr_sampled[1] + tmp_nr_sampled[2];
-
-	spin_unlock(&debug_lock);
-
-	pr_info("---------------------------------------\n");
-	pr_info("nr_sampled: %llu\n", tmp_nr_sampled[0] + tmp_nr_sampled[1] 
-								+ tmp_nr_sampled[2] + tmp_nr_sampled[3]);
-	pr_info("----DRAM_READ: %llu\n", tmp_nr_sampled[0]);
-#ifdef CXL_MODE
-	pr_info("----CXL_READ: %llu\n", tmp_nr_sampled[2]);
-#else
-	pr_info("----PMEM_READ: %llu\n", tmp_nr_sampled[1]);
-#endif
-	pr_info("----STORE_ALL: %llu\n", tmp_nr_sampled[3]);
-	pr_info("nr_found: %llu\n", tmp_nr_found);
-	pr_info("nr_not_found: %llu\n", tmp_nr_not_found);
-	pr_info("nr_found + nr_not_found: %llu\n", tmp_nr_found + tmp_nr_not_found);
-	pr_info("nr_skip: %llu\n", tmp_nr_skip);
-	pr_info("nr_throttled: %llu\n", tmp_nr_throttled);
-	pr_info("nr_losted: %llu\n", tmp_nr_losted);
-	pr_info("nr_cooled: %llu\n", tmp_nr_cooled);
-	pr_info("nr_migrated: %llu MB\n", tmp_nr_migrated);
-	pr_info("=======================================\n");
-
+		spin_lock(&debug->lock);
+		for (j = 0; j < 4; j++)
+			debug->nr_sampled[j] = 0;
+		debug->nr_found = 0;
+		debug->nr_cooled = 0;
+		debug->nr_migrated = 0;
+		spin_unlock(&debug->lock);
+	}
 }
 
 static int kdebugd_main(void *data)
@@ -504,7 +447,10 @@ static int kdebugd_main(void *data)
 	while (!kthread_should_stop()) {
 		if (mtat_debug_on)
 			print_debug_stats();
-		ssleep(1);
+		update_debug_stats();
+		clear_debug_stats();
+
+		msleep(cooling_period);
 	}
 
 	pr_info("kdebugd exit\n");
@@ -517,32 +463,14 @@ static int kdebugd_main(void *data)
  * PEBS related variables and functions *
  ****************************************
  */
-static struct perf_event ***events;
-static int **events_fd;
-
-#ifdef CXL_MODE
-static size_t configs[] = { DRAM_READ, CXL_READ, STORE_ALL };
-#else
-static size_t configs[] = { DRAM_READ, PMEM_READ, STORE_ALL };
-#endif
-
-static size_t cpus[] = {16,17,18,19,20,21,22,23,
-					   48,49,50,51,52,53,54,55,56,57,58,59,
-					   64,65,66,67,68,69,70,71};
-//static size_t cpus[] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,
-//					   48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71};
-//static size_t cpus[] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23};
-//static size_t cpus[] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,
-//						25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48};
-static struct task_struct *kpebsd;
 
 // m_page->lock을 잡고 호출해야함.
-// hg->lock도 필요
-static bool is_hot_page(struct mtat_page *m_page)
+// app->lock도 필요
+static bool is_hot_page(struct mtat_page *m_page, uint64_t hot_threshold)
 {
 	uint64_t hot_access;
 
-	hot_access = hg_get_accesses(hg[m_page->pids_idx].hot_threshold);
+	hot_access = hg_get_accesses(hot_threshold);
 
 	if (m_page->accesses >= hot_access)
 		return true;
@@ -551,12 +479,12 @@ static bool is_hot_page(struct mtat_page *m_page)
 }
 
 // m_page->lock 필요
-// hg->lock도 필요
+// app->lock도 필요
 // hot도 true로 뱉음
-static bool is_warm_page(struct mtat_page *m_page)
+static bool is_warm_page(struct mtat_page *m_page, uint64_t warm_threshold)
 {
 	uint64_t warm_access;
-	warm_access = hg_get_accesses(hg[m_page->pids_idx].warm_threshold);
+	warm_access = hg_get_accesses(warm_threshold);
 
 	if (m_page->accesses >= warm_access)
 		return true;
@@ -571,42 +499,44 @@ static void update_page_list_with_mpage(struct mtat_page *m_page)
 {
 	int prev_hotness = m_page->hotness;
 	int cur_hotness;
-	int pids_idx = m_page->pids_idx;
+	int app_idx = m_page->apps_idx;
 	int nid = m_page->nid;
+	struct app_struct *app = &apps[app_idx];
+	struct access_histogram *hg = &app->hg;
 	
 
-	spin_lock(&hg[pids_idx].lock);
-	if (is_hot_page(m_page))
+	spin_lock(&hg->lock);
+	if (is_hot_page(m_page, hg->hot_threshold))
 		cur_hotness = HOT;
-	else if (is_warm_page(m_page))
+	else if (is_warm_page(m_page, hg->warm_threshold))
 		cur_hotness = WARM;
 	else
 		cur_hotness = COLD;
-	spin_unlock(&hg[pids_idx].lock);
+	spin_unlock(&hg->lock);
 
 	if (prev_hotness == cur_hotness)
 		return;
 
 	m_page->hotness = cur_hotness;
-	page_list_del(m_page, &mtat_pages[prev_hotness][pids_idx][nid]);
-	page_list_add(m_page, &mtat_pages[cur_hotness][pids_idx][nid]);
+	page_list_del(m_page, &mtat_pages[prev_hotness][app_idx][nid]);
+	page_list_add(m_page, &mtat_pages[cur_hotness][app_idx][nid]);
 }
 
-static void partial_cooling_pid(int pid_idx)
+static void periodic_cooling_pid(int app_idx)
 {
 	struct mtat_page *m_page;
+	struct app_struct *app = &apps[app_idx];
+	struct access_histogram *hg = &app->hg;
+	struct mtat_debug_info *debug = &app->debug;
 	int nr_cooled = 0;
 	int cur_access, prev_idx, cur_idx;
 
-	spin_lock(&total_pages_lock[pid_idx]);
-	list_for_each_entry(m_page, &total_pages[pid_idx], t_list) {
+	spin_lock(&total_pages_lock[app_idx]);
+	list_for_each_entry(m_page, &total_pages[app_idx], t_list) {
 		spin_lock(&m_page->lock);
 
 		// 접근횟수 cooling
-		if (zero_cooling_on)
-			m_page->accesses = 0;
-		else
-			m_page->accesses >>= 1;
+		m_page->accesses >>= 1;
 
 		// 쿨링 후 필요하면 cold list로 보내기
 		update_page_list_with_mpage(m_page);
@@ -617,59 +547,71 @@ static void partial_cooling_pid(int pid_idx)
 		cur_idx = hg_get_idx(cur_access);
 		m_page->hg_idx = cur_idx;
 
-
-
 		// 쿨링 후 히스토그램 카운터 관리
-		spin_lock(&hg[pid_idx].lock);
+		spin_lock(&hg->lock);
 
-		hg[pid_idx].hg[prev_idx]--;
-		hg[pid_idx].hg[cur_idx]++;
-		if (cur_idx == 0 && prev_idx != 0)
-			hg[pid_idx].nr_sampled--;
+		hg->histogram[prev_idx]--;
+		hg->histogram[cur_idx]++;
 
-		spin_unlock(&hg[pid_idx].lock);
+		spin_unlock(&hg->lock);
 		spin_unlock(&m_page->lock);
 
 		nr_cooled++;
 	}
-	spin_unlock(&total_pages_lock[pid_idx]);
+	spin_unlock(&total_pages_lock[app_idx]);
 
-	spin_lock(&debug_lock);
-	debug_nr_cooled += nr_cooled;
-	spin_unlock(&debug_lock);
+	spin_lock(&debug->lock);
+	debug->nr_cooled += nr_cooled;
+	spin_unlock(&debug->lock);
 }
 
-static void partial_cooling(void)
+static void periodic_cooling(void)
 {
 	int i;
+	struct app_struct *app;
 
-	for (i = 0; i < MAX_PIDS; i++) {
-		if (pids[i] == PID_NONE)
+	for (i = 0; i < MAX_APPS; i++) {
+		app = &apps[i];
+		if (app->pid == PID_NONE) {
 			break;
-		partial_cooling_pid(i);
+		}
+
+		periodic_cooling_pid(i);
 	}
 }
 
-static void pebs_sample(uint64_t pfn) 
+static void pebs_sample(uint64_t pfn, size_t config) 
 {
-	int nid, pid_idx;
+	int nid, app_idx;
 	struct mtat_page *m_page = NULL;
+	struct app_struct *app;
+	struct access_histogram *hg;
+	struct mtat_debug_info *debug;
 	uint64_t cur_access, prev_idx, cur_idx;
 
 	m_page = rhashtable_lookup_fast(hashtable, &pfn, params);
 	if (!m_page) {
-		//pr_info("pfn: %llu\n", pfn);
-		spin_lock(&debug_lock);
-		debug_nr_not_found++;
-		spin_unlock(&debug_lock);
 		return;
 	}
-	spin_lock(&debug_lock);
-	debug_nr_found++;
-	spin_unlock(&debug_lock);
 	
-	pid_idx = m_page->pids_idx;
+	app_idx = m_page->apps_idx;
 	nid = m_page->nid;
+
+	app = &apps[app_idx];
+	debug = &app->debug;
+	hg = &app->hg;
+
+	spin_lock(&debug->lock);
+	debug->nr_found++;
+	if (configs[config] == DRAM_READ)
+		debug->nr_sampled[0]++;
+	else if (configs[config] == PMEM_READ)
+		debug->nr_sampled[1]++;
+	else if (configs[config] == CXL_READ)
+		debug->nr_sampled[2]++;
+	else
+		debug->nr_sampled[3]++;
+	spin_unlock(&debug->lock);
 
 	spin_lock(&m_page->lock);
 
@@ -686,14 +628,12 @@ static void pebs_sample(uint64_t pfn)
 	update_page_list_with_mpage(m_page);
 
 	// 히스토그램 카운터 관리
-	spin_lock(&hg[pid_idx].lock);
+	spin_lock(&hg->lock);
 
-	hg[pid_idx].hg[prev_idx]--;
-	hg[pid_idx].hg[cur_idx]++;
-	if (prev_idx == 0 && cur_idx != 0)
-		hg[pid_idx].nr_sampled++;
+	hg->histogram[prev_idx]--;
+	hg->histogram[cur_idx]++;
 
-	spin_unlock(&hg[pid_idx].lock);
+	spin_unlock(&hg->lock);
 	spin_unlock(&m_page->lock);
 }
 
@@ -704,7 +644,6 @@ static int kpebsd_main(void *data)
 	struct perf_event_mmap_page *p;
 	struct perf_event_header *ph;
 	struct perf_sample *ps;
-	//char *pbuf;
 	size_t config, cpu, i;
 	uint64_t pfn, pg_index, offset;
 	int page_shift;
@@ -741,9 +680,6 @@ static int kpebsd_main(void *data)
 				}
 				p = READ_ONCE(pe_rb->user_page);
 				if (READ_ONCE(p->data_head) == READ_ONCE(p->data_tail)) {
-					spin_lock(&debug_lock);
-					debug_nr_skip++;
-					spin_unlock(&debug_lock);
 					continue;
 				}
 
@@ -763,36 +699,19 @@ static int kpebsd_main(void *data)
 						pr_err("ps is NULL\n");
 						break;
 					}
-
-					spin_lock(&debug_lock);
-					if (configs[config] == DRAM_READ)
-						debug_nr_sampled[0]++;
-					else if (configs[config] == PMEM_READ)
-						debug_nr_sampled[1]++;
-					else if (configs[config] == CXL_READ)
-						debug_nr_sampled[2]++;
-					else
-						debug_nr_sampled[3]++;
-					spin_unlock(&debug_lock);
-
+					
 					if (cpu != ps->cpu) {
 						//pr_info("current v.s. sample: %lu, %u\n", cpu, ps->cpu);
 						break;
 					}
 
 					pfn = perf_virt_to_phys(ps->addr, ps->pid) >> HPAGE_SHIFT;
-					pebs_sample(pfn);
+					pebs_sample(pfn, config);
 					break;
 				case PERF_RECORD_THROTTLE:
 				case PERF_RECORD_UNTHROTTLE:
-					spin_lock(&debug_lock);
-					debug_nr_throttled++;
-					spin_unlock(&debug_lock);
 					break;
 				case PERF_RECORD_LOST_SAMPLES:
-					spin_lock(&debug_lock);
-					debug_nr_losted++;
-					spin_unlock(&debug_lock);
 					break;
 				}
 				smp_mb();
@@ -848,19 +767,6 @@ static int __perf_event_open(u64 cpu_idx, u64 config)
 static void pebs_restart(void)
 {
 	size_t config, cpu, ncpus = ARRAY_SIZE(cpus);
-	struct file *file;
-
-	/* perf_event_stop 사용하는 방법 -> warning 메세지가 뜨는 문제 있음
-	 * pebs sample 수가 줄어드는 지는 확인 중
-	 */
-	/*
-	for (config = 0; config < ARRAY_SIZE(configs); config++) {
-		for (cpu = 0; cpu < ARRAY_SIZE(cpus); cpu++) {
-			perf_event_stop(events[cpu][config], 1);
-		}
-	}
-	msleep(cooling_period);
-	*/
 
 	/* perf_event_disable + perf_event_open
 	 * 
@@ -874,8 +780,6 @@ static void pebs_restart(void)
 	msleep(100);
 	for (config = 0; config < ARRAY_SIZE(configs); config++) {
 		for (cpu = 0; cpu < ncpus; cpu++) {
-			//file = fget(events_fd[cpu][config]);
-			//fput(file);
 			put_unused_fd(events_fd[cpu][config]);
 		}
 	}
@@ -967,33 +871,37 @@ static int add_new_page(struct page *page)
 static int add_freed_page(struct page *page)
 {
 	uint64_t pfn = page_to_pfn(page) << PAGE_SHIFT >> HPAGE_SHIFT;
-	struct mtat_page *m_page = rhashtable_lookup_fast(hashtable, &pfn, params);
 	int hg_idx;
+	int app_idx;
+	struct mtat_page *m_page = rhashtable_lookup_fast(hashtable, &pfn, params);
+	struct app_struct *app;
+	struct access_histogram *hg;
 
 	if (!m_page) {
 		pr_err("Didn't find page %llu\n", pfn);
 		return 0;
 	}
+	app_idx = m_page->apps_idx;
+	app = &apps[app_idx];
+	hg = &app->hg;
 	
-	spin_lock(&total_pages_lock[m_page->pids_idx]);
+	spin_lock(&total_pages_lock[app_idx]);
 	spin_lock(&m_page->lock);
 
 	list_del(&m_page->t_list);
 
 	hg_idx = m_page->hg_idx;
 
-	page_list_del(m_page, &mtat_pages[m_page->hotness][m_page->pids_idx][m_page->nid]);
+	page_list_del(m_page, &mtat_pages[m_page->hotness][app_idx][m_page->nid]);
 	page_list_add(m_page, &f_pages[m_page->nid]);
 
-	spin_lock(&hg[m_page->pids_idx].lock);
+	spin_lock(&hg->lock);
 
-	hg[m_page->pids_idx].hg[hg_idx]--;
-	if (hg_idx != 0)
-		hg[m_page->pids_idx].nr_sampled--;
+	hg->histogram[hg_idx]--;
 
-	spin_unlock(&hg[m_page->pids_idx].lock);
+	spin_unlock(&hg->lock);
 	spin_unlock(&m_page->lock);
-	spin_unlock(&total_pages_lock[m_page->pids_idx]);
+	spin_unlock(&total_pages_lock[app_idx]);
 
 	return 0;
 }
@@ -1004,12 +912,10 @@ static void build_page_list(void)
 	struct hstate *h;
 	struct page *page;
 
-	spin_lock_init(&lock);
-	spin_lock_init(&debug_lock);
+	init_apps();
 	for (i = 0; i < NR_MEM_TYPES; i++) 
 		init_page_list(&f_pages[i]);
-	for (i = 0; i < MAX_PIDS; i++) {
-		pids[i] = PID_NONE;
+	for (i = 0; i < MAX_APPS; i++) {
 		for (j = 0; j < NR_MEM_TYPES; j++) {
 			for (k = 0; k < NR_HOTNESS_TYPES; k++)
 				init_page_list(&mtat_pages[k][i][j]);
@@ -1043,7 +949,10 @@ static void build_page_list(void)
 static void reserve_page(struct hstate *h, int nid, pid_t pid, 
 		struct mtat_page *m_page)
 {
-	int i;
+	struct app_struct *app;
+	struct access_histogram *hg;
+	int i, app_idx;
+	bool need_add_dir = false;
 
 	/*
 	if (MTAT_MIGRATION_MODE == HEMEM) {
@@ -1053,42 +962,49 @@ static void reserve_page(struct hstate *h, int nid, pid_t pid,
 	}
 	*/
 
-	spin_lock(&lock);
-	for (i = 0; i < MAX_PIDS; i++) {
-		if (pids[i] == PID_NONE || pids[i] == pid)
+	for (i = 0; i < MAX_APPS; i++) {
+		app = &apps[i];
+		spin_lock(&app->lock);
+		if (app->pid == PID_NONE || app->pid == pid) {
+			if (app->pid == PID_NONE) {
+				need_add_dir = true;
+				app->pid = pid;
+			}
+			spin_unlock(&app->lock);
+			app_idx = i;
+			if (need_add_dir)
+				mtat_sysfs_apps_dir_add_dirs(mtat_sysfs->apps_dir, app_idx);
 			break;
+		}
+		spin_unlock(&app->lock);
 	}
-	if (i == MAX_PIDS) {
-		pr_err("Too many pids!\n");
-		spin_unlock(&lock);
+	if (i == MAX_APPS) {
+		pr_err("Too many apps!\n");
 		return;
 	}
-	if (pids[i] == PID_NONE)
-		pids[i] = pid;
-	spin_unlock(&lock);
 
-//m_page_init:
-	spin_lock(&total_pages_lock[i]);
+	hg = &app->hg;
+
+	spin_lock(&total_pages_lock[app_idx]);
 	spin_lock(&m_page->lock);
 
 	m_page->hotness = COLD;
-	m_page->pids_idx = i;
+	m_page->apps_idx = app_idx;
 	m_page->nid = nid;
 	m_page->accesses = 0;
 	m_page->hg_idx = 0;
 	page_list_del(m_page, &f_pages[nid]);
-	page_list_add(m_page, &mtat_pages[COLD][i][nid]);
+	page_list_add(m_page, &mtat_pages[COLD][app_idx][nid]);
 
-	list_add_tail(&m_page->t_list, &total_pages[i]);
+	list_add_tail(&m_page->t_list, &total_pages[app_idx]);
 
+	spin_lock(&hg->lock);
 
-	spin_lock(&hg[m_page->pids_idx].lock);
+	hg->histogram[0]++;
 
-	hg[m_page->pids_idx].hg[0]++;
-
-	spin_unlock(&hg[m_page->pids_idx].lock);
+	spin_unlock(&hg->lock);
 	spin_unlock(&m_page->lock);
-	spin_unlock(&total_pages_lock[i]);
+	spin_unlock(&total_pages_lock[app_idx]);
 
 
 	list_move(&m_page->page->lru, &h->hugepage_activelist);
@@ -1150,42 +1066,45 @@ static struct page *mtat_free_page(struct hstate *h, struct page *page)
 /*
  * Migration daemon
  */
-static struct task_struct *kmigrated;
-
 static void sync_mtat_page_after_migration(struct migration_target_control *mtc,
 		struct mtat_page *m_page)
 {
 	int prev_idx, cur_idx;
+	int app_idx;
+	struct app_struct *app;
+	struct access_histogram *hg;
+
 	if (mtc->hotness == COLD)
 		return;
 
 	spin_lock(&m_page->lock);
 	
 	prev_idx = m_page->hg_idx;
-
-	spin_lock(&hg[m_page->pids_idx].lock);
+	app_idx = m_page->apps_idx;
+	app = &apps[app_idx];
+	hg = &app->hg;
+	spin_lock(&hg->lock);
 	switch (mtc->hotness) {
 	case HOT:
-		m_page->accesses = hg_get_accesses(hg[m_page->pids_idx].hot_threshold);
+		m_page->accesses = hg_get_accesses(hg->hot_threshold);
 		break;
 	case WARM:
-		m_page->accesses = hg_get_accesses(hg[m_page->pids_idx].warm_threshold);
+		m_page->accesses = hg_get_accesses(hg->warm_threshold);
 		break;
 	}
-	spin_unlock(&hg[m_page->pids_idx].lock);
+	spin_unlock(&hg->lock);
 
 	cur_idx = hg_get_idx(m_page->accesses);
 	m_page->hg_idx = cur_idx;
 
 	update_page_list_with_mpage(m_page);
 
-	spin_lock(&hg[m_page->pids_idx].lock);
+	spin_lock(&hg->lock);
 
-	hg[m_page->pids_idx].hg[prev_idx]--;
-	hg[m_page->pids_idx].hg[cur_idx]++;
-	hg[m_page->pids_idx].nr_sampled++;
+	hg->histogram[prev_idx]--;
+	hg->histogram[cur_idx]++;
 
-	spin_unlock(&hg[m_page->pids_idx].lock);
+	spin_unlock(&hg->lock);
 	spin_unlock(&m_page->lock);
 
 	}
@@ -1210,15 +1129,16 @@ static struct page *mtat_alloc_migration_target(struct page *old, unsigned long 
 	return page;
 }
 
-static unsigned int migrate_page_list(struct list_head *page_list, int nid, int pid, int hotness)
+static unsigned int migrate_page_list(struct list_head *page_list, int nid, struct app_struct *app, int hotness)
 {
 	unsigned int nr_migrated_pages = 0;
 	struct page *page;
 	struct page *page2;
+	struct mtat_debug_info *debug = &app->debug;
 
 	struct migration_target_control mtc = {
 		.nid = nid,
-		.pid = pid,
+		.pid = app->pid,
 		.hotness = hotness
 	};
 
@@ -1234,9 +1154,9 @@ static unsigned int migrate_page_list(struct list_head *page_list, int nid, int 
 		}
 	}
 
-	spin_lock(&debug_lock);
-	debug_nr_migrated += nr_migrated_pages * 4 / 1024; // 4KB pages -> MB
-	spin_unlock(&debug_lock);
+	spin_lock(&debug->lock);
+	debug->nr_migrated += nr_migrated_pages * 4 / 1024; // 4KB pages -> MB
+	spin_unlock(&debug->lock);
 
 	return nr_migrated_pages;
 }
@@ -1264,14 +1184,14 @@ static unsigned int isolate_mtat_pages(struct page_list *from,
 }
 
 static void calculate_migration_target_size(int *target_promote,
-		int *target_demote, int pid_idx, int dram_size)
+		int *target_demote, int app_idx, int dram_size)
 {
 	int nr_fmem[NR_HOTNESS_TYPES], nr_smem[NR_HOTNESS_TYPES];
 	int dram_leftover, nr_need_demote = 0, total_dram_size = 0;
 	int i;
 	for (i = 0; i < NR_HOTNESS_TYPES; i++) {
-		nr_fmem[i] = get_num_pages(&mtat_pages[i][pid_idx][FASTMEM]);
-		nr_smem[i] = get_num_pages(&mtat_pages[i][pid_idx][SLOWMEM]);
+		nr_fmem[i] = get_num_pages(&mtat_pages[i][app_idx][FASTMEM]);
+		nr_smem[i] = get_num_pages(&mtat_pages[i][app_idx][SLOWMEM]);
 		target_promote[i] = 0;
 		target_demote[i] = 0;
 
@@ -1298,101 +1218,114 @@ static void calculate_migration_target_size(int *target_promote,
 	}
 }
 
-static void solorun_migration(void)
+static void mtat_migration(void)
 {
-	struct list_head promote_pages[NR_HOTNESS_TYPES];
-	struct list_head demote_pages[NR_HOTNESS_TYPES];
-	int target_promote[NR_HOTNESS_TYPES], target_demote[NR_HOTNESS_TYPES]; 
-	int i;
+	struct list_head promote_pages[MAX_APPS][NR_HOTNESS_TYPES];
+	struct list_head demote_pages[MAX_APPS][NR_HOTNESS_TYPES];
+	struct app_struct *app;
+	int target_promote[MAX_APPS][NR_HOTNESS_TYPES], target_demote[MAX_APPS][NR_HOTNESS_TYPES]; 
+	int i, j, app_num;
+	uint64_t dram_size;
 
-	for (i = 0; i < NR_HOTNESS_TYPES; i++) {
-		INIT_LIST_HEAD(&promote_pages[i]);
-		INIT_LIST_HEAD(&demote_pages[i]);
-
-	}
-
-	calculate_migration_target_size(target_promote, target_demote, 0, set_lc_dram_size);
-
-	for (i = 0; i < NR_HOTNESS_TYPES; i++) {
-		isolate_mtat_pages(&mtat_pages[i][0][SLOWMEM], &promote_pages[i], target_promote[i]);
-		isolate_mtat_pages(&mtat_pages[i][0][FASTMEM], &demote_pages[i], target_demote[i]);
-	}
-
-	for (i = NR_HOTNESS_TYPES-1; i >= 0; i--) 
-		migrate_page_list(&demote_pages[i], SLOWMEM, pids[0], i);
-
-	for (i = 0; i < NR_HOTNESS_TYPES; i++)
-		migrate_page_list(&promote_pages[i], FASTMEM, pids[0], i);	
-}
-
-/*
- * LC: pids[0], BE: pids[1]
- * LC hot page는 모두 FMEM에 이주
- * LC FMEM cold page는 warm set size 만큼만 남기고 나머지 다 SMEM에 이주
- * FMEM이 남으면 BE의 SMEM page들을 FMEM에 이주 (hot page를 우선적으로)
- */
-static void corun_migration(void)
-{
-	struct list_head promote_pages[2][NR_HOTNESS_TYPES]; // [lc/be]
-	struct list_head demote_pages[2][NR_HOTNESS_TYPES]; // [lc/be]
-	const int lc = 0, be = 1;
-	int lc_target_promote[NR_HOTNESS_TYPES], lc_target_demote[NR_HOTNESS_TYPES]; 
-	int be_target_promote[NR_HOTNESS_TYPES], be_target_demote[NR_HOTNESS_TYPES]; 
-	int i, j;
-
-	for (i = 0; i < 2; i++) {
+	for (i = 0; i < MAX_APPS; i++) {
 		for (j = 0; j < NR_HOTNESS_TYPES; j++) {
 			INIT_LIST_HEAD(&promote_pages[i][j]);
 			INIT_LIST_HEAD(&demote_pages[i][j]);
+			target_promote[i][j] = 0;
+			target_demote[i][j] = 0;
 		}
 	}
 
-	calculate_migration_target_size(lc_target_promote, lc_target_demote, 0, set_lc_dram_size);
-	calculate_migration_target_size(be_target_promote, be_target_demote, 1, 
-									total_dram_pages - set_lc_dram_size);
+	for (i = 0; i < MAX_APPS; i++) {
+		app = &apps[i];
+		if (app->pid == PID_NONE) {
+			app_num = i;
+			break;
+		}
+		spin_lock(&app->lock);
+		dram_size = app->set_dram_size;
+		spin_unlock(&app->lock);
+		calculate_migration_target_size(target_promote[i], target_demote[i], i, dram_size);
+	}
 
 	/* Isolate pages for migration */
-	for (i = 0; i < NR_HOTNESS_TYPES; i++) {
-		isolate_mtat_pages(&mtat_pages[i][be][SLOWMEM], &promote_pages[be][i], be_target_promote[i]);
-		isolate_mtat_pages(&mtat_pages[i][be][FASTMEM], &demote_pages[be][i], be_target_demote[i]);
-
-		isolate_mtat_pages(&mtat_pages[i][lc][SLOWMEM], &promote_pages[lc][i], lc_target_promote[i]);
-		isolate_mtat_pages(&mtat_pages[i][lc][FASTMEM], &demote_pages[lc][i], lc_target_demote[i]);
+	for (i = 0; i < app_num; i++) {
+		for (j = 0; j < NR_HOTNESS_TYPES; j++) {
+			isolate_mtat_pages(&mtat_pages[j][i][SLOWMEM], &promote_pages[i][j], target_promote[i][j]);
+			isolate_mtat_pages(&mtat_pages[j][i][FASTMEM], &demote_pages[i][j], target_demote[i][j]);
+		}
 	}
 
 	/* Do Migration */
-	for (i = NR_HOTNESS_TYPES-1; i >= 0; i--) {
-		migrate_page_list(&demote_pages[be][i], SLOWMEM, pids[be], i);
-		migrate_page_list(&demote_pages[lc][i], SLOWMEM, pids[lc], i);
+	for (i = 0; i < app_num; i++) {
+		for (j = NR_HOTNESS_TYPES-1; j >= 0; j--) {
+			migrate_page_list(&demote_pages[i][j], SLOWMEM, &apps[i], j);
+		}
 	}
-	for (i = 0; i < NR_HOTNESS_TYPES; i++) {
-		migrate_page_list(&promote_pages[lc][i], FASTMEM, pids[lc], i);	
-		migrate_page_list(&promote_pages[be][i], FASTMEM, pids[be], i);	
+	for (i = 0; i < app_num; i++) {
+		for (j = 0; j < NR_HOTNESS_TYPES; j++) {
+			migrate_page_list(&promote_pages[i][j], FASTMEM, &apps[i], j);	
+		}
 	}
 }
 
+//TODO Hemem, Memtis, MTAT 모드 구분하도록 하기.
 static void do_migration(void)
 {
 	switch(MTAT_MIGRATION_MODE) {
-	case SOLORUN:
-		solorun_migration();
-		break;
-	case CORUN:
-		corun_migration();
+	case MTAT:
+		mtat_migration();
 		break;
 	}
 }
 
 static void update_histogram(void)
 {
-	hg_update_hot_threshold(0, set_lc_dram_size);
-	if (MTAT_MIGRATION_MODE == CORUN)
-		hg_update_hot_threshold(1, total_dram_pages - set_lc_dram_size);
+	int i;
+	uint64_t dram_size;
+	struct app_struct *app;
+	for (i = 0; i < MAX_APPS; i++) {
+		app = &apps[i];
+		if (app->pid == PID_NONE) {
+			break;
+		}
+		spin_lock(&app->lock);
+		dram_size = app->set_dram_size;
+		spin_unlock(&app->lock);
+		hg_update_hot_threshold(&app->hg, dram_size);
+	}
+}
+
+void update_app_pages_info(void)
+{
+	struct app_struct *app;
+	int i, j, tmp, dram_pages, total_pages;
+	for (i = 0; i < MAX_APPS; i++) {
+		app = &apps[i];
+		if (app->pid == PID_NONE) {
+			break;
+		}
+
+		dram_pages = 0;
+		total_pages = 0;
+		for (j = 0; j < NR_HOTNESS_TYPES; j++) {
+			tmp = get_num_pages(&mtat_pages[j][i][FASTMEM]);
+			dram_pages += tmp;
+			total_pages += tmp + get_num_pages(&mtat_pages[j][i][SLOWMEM]);
+		}
+
+		spin_lock(&app->lock);
+
+		app->dram_pages = dram_pages;
+		app->total_pages = total_pages;
+
+		spin_unlock(&app->lock);
+
+	}
 }
 
 static int kmigrated_main(void *data)
 {
-	int i, tmp;
 	pr_info("kmigrated start\n");
 
 	mtat_set_cpu_affinity(KMIGRATED_CPU);
@@ -1404,14 +1337,8 @@ static int kmigrated_main(void *data)
 			do_migration();
 		}
 
-		lc_dram_pages = 0;
-		lc_total_pages = 0;
-		for (i = 0; i < NR_HOTNESS_TYPES; i++) {
-			tmp = get_num_pages(&mtat_pages[i][0][FASTMEM]);
-			lc_dram_pages += tmp;
-			lc_total_pages += tmp + get_num_pages(&mtat_pages[i][0][SLOWMEM]);
-		}
-
+		update_app_pages_info();
+		
 		msleep(mtat_migration_period);
 		if (need_resched())
 			schedule();
@@ -1423,28 +1350,40 @@ static int kmigrated_main(void *data)
 /*
  * Cooling daemon
  */
-static struct task_struct *kcoolingd;
+static void update_fixed_hg(void)
+{
+	struct app_struct *app;
+	struct access_histogram *hg;
+	uint64_t tmp_hg[16];
+	int i, j;
+	for (i = 0; i < MAX_APPS; i++) {
+		app = &apps[i];
+		if (app->pid == PID_NONE) {
+			break;
+		}
+		hg = &app->hg;
+		spin_lock(&hg->lock);
+		for (j = 0; j < 16; j++)
+			tmp_hg[j] = hg->histogram[j];
+		spin_unlock(&hg->lock);
+
+		spin_lock(&app->lock);
+		for (j = 0; j < 16; j++)
+			app->fixed_hg[j] = tmp_hg[j];
+		spin_unlock(&app->lock);
+	}
+}
 
 static int kcoolingd_main(void *data)
 {
-	uint64_t tmp_hg[16];
-	int i;
 	pr_info("kcoolingd start\n");
 
 	mtat_set_cpu_affinity(KMIGRATED_CPU);
 
 	while (!kthread_should_stop()) {
-		spin_lock(&hg[0].lock);
-		for (i = 0; i < 16; i++)
-			tmp_hg[i] = hg[0].hg[i];
-		spin_unlock(&hg[0].lock);
-
-		spin_lock(&debug_lock);
-		for (i = 0; i < 16; i++)
-			lc_hg[i] = tmp_hg[i];
-		spin_unlock(&debug_lock);
-
-		partial_cooling();
+		update_fixed_hg();
+		
+		periodic_cooling();
 		msleep(cooling_period);
 		if (need_resched())
 			schedule();
@@ -1454,11 +1393,379 @@ static int kcoolingd_main(void *data)
 }
 
 /*
+ * SYSFS functions
+ */
+static ssize_t migrate_on_show(struct kobject *kobj, struct kobj_attribute *attr,
+		char *buf)
+{
+	return sysfs_emit(buf, "%lu\n", migrate_on);
+}
+
+static ssize_t migrate_on_store(struct kobject *kobj, struct kobj_attribute *attr,
+		const char *buf, size_t count)
+{
+	unsigned long input;
+	int err;
+
+	err = kstrtoul(buf, 0, &input);
+	if (err)
+		return err;
+
+	migrate_on = input;
+	return count;
+}
+
+static ssize_t pebs_on_show(struct kobject *kobj, struct kobj_attribute *attr,
+		char *buf)
+{
+	return sysfs_emit(buf, "%lu\n", pebs_on);
+}
+
+static ssize_t pebs_on_store(struct kobject *kobj, struct kobj_attribute *attr,
+		const char *buf, size_t count)
+{
+	unsigned long input;
+	int err;
+
+	err = kstrtoul(buf, 0, &input);
+	if (err)
+		return err;
+
+	pebs_on = input;
+	return count;
+}
+
+static ssize_t mtat_debug_on_show(struct kobject *kobj, struct kobj_attribute *attr,
+		char *buf)
+{
+	return sysfs_emit(buf, "%lu\n", mtat_debug_on);
+}
+
+static ssize_t mtat_debug_on_store(struct kobject *kobj, struct kobj_attribute *attr,
+		const char *buf, size_t count)
+{
+	unsigned long input;
+	int err;
+
+	err = kstrtoul(buf, 0, &input);
+	if (err)
+		return err;
+
+	mtat_debug_on = input;
+	return count;
+}
+
+static ssize_t total_dram_pages_show(struct kobject *kobj, struct kobj_attribute *attr,
+		char *buf)
+{
+	return sysfs_emit(buf, "%lu\n", total_dram_pages);
+}
+
+static struct kobj_attribute migrate_on_attr = __ATTR_RW_MODE(migrate_on, 0600);
+static struct kobj_attribute pebs_on_attr = __ATTR_RW_MODE(pebs_on, 0600);
+static struct kobj_attribute mtat_debug_on_attr = __ATTR_RW_MODE(mtat_debug_on, 0600);
+static struct kobj_attribute total_dram_pages_attr = __ATTR_RO_MODE(total_dram_pages, 0400);
+
+/*
+ * app_dir
+ */
+static ssize_t set_dram_size_store(struct kobject *kobj, struct kobj_attribute *attr,
+		const char *buf, size_t count)
+{
+	struct mtat_sysfs_app_dir *app_dir =container_of(kobj, struct mtat_sysfs_app_dir, kobj);
+	struct app_struct *app = &apps[app_dir->app_idx];
+	unsigned long input;
+	int err;
+
+	err = kstrtoul(buf, 0, &input);
+	if (err)
+		return err;
+
+	spin_lock(&app->lock);
+	app->set_dram_size = input;
+	spin_unlock(&app->lock);
+
+	return count;
+}
+
+static ssize_t set_dram_size_show(struct kobject *kobj, struct kobj_attribute *attr,
+		char *buf)
+{
+	struct mtat_sysfs_app_dir *app_dir =container_of(kobj, struct mtat_sysfs_app_dir, kobj);
+	struct app_struct *app = &apps[app_dir->app_idx];
+	int len = 0;
+
+	spin_lock(&app->lock);
+	len = snprintf(buf, PAGE_SIZE, "%llu\n", app->set_dram_size);
+	spin_unlock(&app->lock);
+
+	return len;
+}
+
+static ssize_t nr_total_sampled_show(struct kobject *kobj, struct kobj_attribute *attr,
+		char *buf)
+{
+	struct mtat_sysfs_app_dir *app_dir =container_of(kobj, struct mtat_sysfs_app_dir, kobj);
+	struct app_struct *app = &apps[app_dir->app_idx];
+	int len = 0;
+
+	spin_lock(&app->lock);
+	len = snprintf(buf, PAGE_SIZE, "%llu\n", app->nr_total_sampled);
+	spin_unlock(&app->lock);
+
+	return len;
+}
+
+static ssize_t nr_fmem_read_show(struct kobject *kobj, struct kobj_attribute *attr,
+		char *buf)
+{
+	struct mtat_sysfs_app_dir *app_dir =container_of(kobj, struct mtat_sysfs_app_dir, kobj);
+	struct app_struct *app = &apps[app_dir->app_idx];
+	int len = 0;
+
+	spin_lock(&app->lock);
+	len = snprintf(buf, PAGE_SIZE, "%llu\n", app->nr_fmem_read);
+	spin_unlock(&app->lock);
+
+	return len;
+}
+
+static ssize_t nr_smem_read_show(struct kobject *kobj, struct kobj_attribute *attr,
+		char *buf)
+{
+	struct mtat_sysfs_app_dir *app_dir =container_of(kobj, struct mtat_sysfs_app_dir, kobj);
+	struct app_struct *app = &apps[app_dir->app_idx];
+	int len = 0;
+
+	spin_lock(&app->lock);
+	len = snprintf(buf, PAGE_SIZE, "%llu\n", app->nr_smem_read);
+	spin_unlock(&app->lock);
+
+	return len;
+}
+
+static ssize_t dram_pages_show(struct kobject *kobj, struct kobj_attribute *attr,
+		char *buf)
+{
+	struct mtat_sysfs_app_dir *app_dir =container_of(kobj, struct mtat_sysfs_app_dir, kobj);
+	struct app_struct *app = &apps[app_dir->app_idx];
+	int len = 0;
+
+	spin_lock(&app->lock);
+	len = snprintf(buf, PAGE_SIZE, "%llu\n", app->dram_pages);
+	spin_unlock(&app->lock);
+
+	return len;
+}
+
+static ssize_t total_pages_show(struct kobject *kobj, struct kobj_attribute *attr,
+		char *buf)
+{
+	struct mtat_sysfs_app_dir *app_dir =container_of(kobj, struct mtat_sysfs_app_dir, kobj);
+	struct app_struct *app = &apps[app_dir->app_idx];
+	int len = 0;
+
+	spin_lock(&app->lock);
+	len = snprintf(buf, PAGE_SIZE, "%llu\n", app->total_pages);
+	spin_unlock(&app->lock);
+
+	return len;
+}
+
+static ssize_t histogram_show(struct kobject *kobj, struct kobj_attribute *attr,
+		char *buf)
+{
+	struct mtat_sysfs_app_dir *app_dir =container_of(kobj, struct mtat_sysfs_app_dir, kobj);
+	struct app_struct *app = &apps[app_dir->app_idx];
+	int i, len = 0, ret;
+	size_t buf_size = PAGE_SIZE;
+
+	spin_lock(&app->lock);
+	for (i = 0; i < 16; i++) {
+		ret = snprintf(buf + len, buf_size - len, "%llu ", app->fixed_hg[i]);
+
+		if (ret >= buf_size - len) 
+			break;
+
+		len += ret;
+	}
+	spin_unlock(&app->lock);
+
+	return len;
+}
+
+static struct kobj_attribute set_dram_size_attr = __ATTR_RW_MODE(set_dram_size, 0600);
+static struct kobj_attribute nr_total_sampled_attr = __ATTR_RO_MODE(nr_total_sampled, 0400);
+static struct kobj_attribute nr_fmem_read_attr = __ATTR_RO_MODE(nr_fmem_read, 0400);
+static struct kobj_attribute nr_smem_read_attr = __ATTR_RO_MODE(nr_smem_read, 0400);
+static struct kobj_attribute dram_pages_attr = __ATTR_RO_MODE(dram_pages, 0400);
+static struct kobj_attribute total_pages_attr = __ATTR_RO_MODE(total_pages, 0400);
+static struct kobj_attribute histogram_attr = __ATTR_RO_MODE(histogram, 0400);
+
+static struct attribute *mtat_sysfs_app_dir_attrs[] = {
+	&set_dram_size_attr.attr,
+	&nr_total_sampled_attr.attr,
+	&nr_fmem_read_attr.attr,
+	&nr_smem_read_attr.attr,
+	&dram_pages_attr.attr,
+	&total_pages_attr.attr,
+	&histogram_attr.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(mtat_sysfs_app_dir);
+
+static struct kobj_type mtat_sysfs_app_dir_ktype = {
+	.sysfs_ops = &kobj_sysfs_ops,
+	.default_groups = mtat_sysfs_app_dir_groups,
+};
+
+/*
+ * apps_dir
+ */
+static struct mtat_sysfs_apps_dir *mtat_sysfs_apps_dir_alloc(void)
+{
+	struct mtat_sysfs_apps_dir *apps_dir;
+	int i;
+	apps_dir = kzalloc(sizeof(struct mtat_sysfs_apps_dir), GFP_KERNEL);
+	if (!apps_dir)
+		goto out;
+	
+	for (i = 0; i < MAX_APPS; i++)
+		apps_dir->app_dirs[i].app_idx = PID_NONE;
+
+out:
+	return apps_dir;
+}
+
+static int mtat_sysfs_apps_dir_add_dirs(struct mtat_sysfs_apps_dir *apps_dir, int app_idx)
+{
+	struct mtat_sysfs_app_dir *app_dir = &apps_dir->app_dirs[app_idx];
+	struct app_struct *app = &apps[app_idx];
+	int err;
+
+	app_dir->app_idx = app_idx;
+
+	err = kobject_init_and_add(&app_dir->kobj,
+			&mtat_sysfs_app_dir_ktype, &apps_dir->kobj,
+			"%d", app->pid);
+	if (err)
+		kobject_put(&app_dir->kobj);
+
+	return err;
+}
+
+static void mtat_sysfs_apps_dir_release(struct kobject *kobj)
+{
+	kfree(container_of(kobj, struct mtat_sysfs_apps_dir, kobj));
+}
+
+static struct attribute *mtat_sysfs_apps_dir_attrs[] = {
+	NULL,
+};
+ATTRIBUTE_GROUPS(mtat_sysfs_apps_dir);
+
+static struct kobj_type mtat_sysfs_apps_dir_ktype = {
+	.release = mtat_sysfs_apps_dir_release,
+	.sysfs_ops = &kobj_sysfs_ops,
+	.default_groups = mtat_sysfs_apps_dir_groups,
+};
+
+/* 
+ * ui_dir
+ */
+static struct mtat_sysfs_ui_dir *mtat_sysfs_ui_dir_alloc(void)
+{
+	return kzalloc(sizeof(struct mtat_sysfs_ui_dir), GFP_KERNEL);
+}
+
+static int mtat_sysfs_ui_dir_add_dirs(struct mtat_sysfs_ui_dir *ui_dir)
+{
+	struct mtat_sysfs_apps_dir *apps_dir;
+	int err;
+
+	apps_dir = mtat_sysfs_apps_dir_alloc();
+	if (!apps_dir)
+		return -ENOMEM;
+
+	err = kobject_init_and_add(&apps_dir->kobj,
+			&mtat_sysfs_apps_dir_ktype, &ui_dir->kobj,
+			"apps");
+	if (err) {
+		kobject_put(&apps_dir->kobj);
+		return err;
+	}
+	ui_dir->apps_dir = apps_dir;
+	return err;
+}
+
+static void mtat_sysfs_ui_dir_release(struct kobject *kobj)
+{
+	kfree(mtat_sysfs);
+}
+
+static struct attribute *mtat_sysfs_ui_dir_attrs[] = {
+	&migrate_on_attr.attr,
+	&pebs_on_attr.attr,
+	&mtat_debug_on_attr.attr,
+	&total_dram_pages_attr.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(mtat_sysfs_ui_dir);
+
+static struct kobj_type mtat_sysfs_ui_dir_ktype = {
+	.release = mtat_sysfs_ui_dir_release,
+	.sysfs_ops = &kobj_sysfs_ops,
+	.default_groups = mtat_sysfs_ui_dir_groups,
+};
+
+static int mtat_sysfs_init(void)
+{
+	int err;
+
+	mtat_sysfs = mtat_sysfs_ui_dir_alloc();
+	if (!mtat_sysfs) {
+		return -ENOMEM;
+	}
+	err = kobject_init_and_add(&mtat_sysfs->kobj, &mtat_sysfs_ui_dir_ktype,
+			mm_kobj, "mtat");
+	if (err)
+		goto out;
+	err = mtat_sysfs_ui_dir_add_dirs(mtat_sysfs);
+	if (err)
+		goto out;
+	return 0;
+
+out:
+	kobject_put(&mtat_sysfs->kobj);
+	return err;
+}
+
+static void mtat_sysfs_exit(void)
+{
+	struct mtat_sysfs_apps_dir *apps_dir;
+	struct mtat_sysfs_app_dir *app_dir;
+	int i;
+	if (mtat_sysfs) {
+		apps_dir = mtat_sysfs->apps_dir;
+		for (i = 0; i < MAX_APPS; i++) {
+			app_dir = &apps_dir->app_dirs[i];
+			if (app_dir->app_idx != PID_NONE)
+				kobject_put(&app_dir->kobj);
+		}
+		kobject_put(&apps_dir->kobj);
+		kobject_put(&mtat_sysfs->kobj);
+	}
+}
+
+/*
  * MTAT initialization
  */
 int init_module(void)
 {
-	int cpu;
+	if (mtat_sysfs_init()) {
+		pr_err("Failed to init mtat sysfs\n");
+		return -1;
+	}
 
 	FASTMEM = memory_nodes[0];
 	SLOWMEM = memory_nodes[1];
@@ -1466,33 +1773,12 @@ int init_module(void)
 	if (init_hashtable())
 		return -1;
 
-	init_hg();
-	if (sysfs_create_file(kernel_kobj, &lc_hg_attr.attr)) {
-		pr_info("failed to create sysfs entry for lc_hg\n");
-		return -1;
-	}
-	if (sysfs_create_file(kernel_kobj, &lc_nr_sampled_attr.attr)) {
-		pr_info("failed to create sysfs entry for lc_nr_sampled\n");
-		return -1;
-	}
-	if (sysfs_create_file(kernel_kobj, &lc_nr_read_attr.attr)) {
-		pr_info("failed to create sysfs entry for lc_nr_read\n");
-		return -1;
-	}
-	if (sysfs_create_file(kernel_kobj, &lc_nr_dram_read_attr.attr)) {
-		pr_info("failed to create sysfs entry for lc_nr_dram_read\n");
-		return -1;
-	}
-	if (sysfs_create_file(kernel_kobj, &lc_nr_smem_read_attr.attr)) {
-		pr_info("failed to create sysfs entry for lc_nr_smem_read\n");
-		return -1;
-	}
 	build_page_list();
 
 	set_dequeue_hook(mtat_allocate_page);
 	set_enqueue_hook(mtat_free_page);
 
-	/* pebs init */
+	// pebs init
 	pebs_start();
 
 	kdebugd = kthread_run(kdebugd_main, NULL, "kdebugd");
@@ -1519,8 +1805,6 @@ int init_module(void)
  */
 void cleanup_module(void)
 {
-	int cpu;
-
 	if (kcoolingd)
 		kthread_stop(kcoolingd);
 	if (kmigrated)
@@ -1528,7 +1812,7 @@ void cleanup_module(void)
 	if (kdebugd)
 		kthread_stop(kdebugd);
 
-	/* pebs stop */ 
+	// pebs stop  
 	pebs_stop();
 
 	set_dequeue_hook(NULL);
@@ -1536,12 +1820,7 @@ void cleanup_module(void)
 
 	destroy_hashtable();
 	
-	sysfs_remove_file(kernel_kobj, &lc_hg_attr.attr);
-	sysfs_remove_file(kernel_kobj, &lc_nr_sampled_attr.attr);
-	sysfs_remove_file(kernel_kobj, &lc_nr_read_attr.attr);
-	sysfs_remove_file(kernel_kobj, &lc_nr_dram_read_attr.attr);
-	sysfs_remove_file(kernel_kobj, &lc_nr_smem_read_attr.attr);
-
+	mtat_sysfs_exit();
 	pr_info("Remove MTAT module\n");
 }
 

@@ -17,16 +17,53 @@
 #include <linux/vmalloc.h>
 #include <linux/cpumask.h>
 #include <asm-generic/io.h>
+/*
+ * Debug
+ */
+#define KDEBUGD_CPU 6
 
-#define PID_NONE -1
-#define MAX_PIDS 8
-enum app_types {
-	LC = 0,
-	BE = 1,
-	NR_APP_TYPES
+struct mtat_debug_info {
+	uint64_t nr_sampled[4];
+	uint64_t nr_found;
+	uint64_t nr_cooled;
+	uint64_t nr_migrated;
+	spinlock_t lock;
 };
+
+/*
+ * App struct
+ */
+#define PID_NONE -1
+#define MAX_APPS 8
+
+struct access_histogram {
+	uint64_t histogram[16];
+	uint64_t hot_threshold;
+	uint64_t warm_threshold;
+	spinlock_t lock;
+};
+
 struct app_struct {
 	int pid;
+
+	/* lock 으로 보호 start */
+	uint64_t set_dram_size;
+	// debug thread가 1초마다 업데이트. 즉, 1초동안 쌓인 샘플 수를 의미.
+	uint64_t nr_total_sampled; // TODO lc_nr_sampled 대체
+	uint64_t nr_fmem_read;
+	uint64_t nr_smem_read;
+	// migration thread가 1ms마다 업데이트. migration 할때마다 업데이트.
+	uint64_t dram_pages; // TODO lc_dram_pages 대체
+	uint64_t total_pages; // TODO lc_total_pages 대체
+	// cooling thread가 1초마다 업데이트. 즉, 1초동안 쌓인 histogram을 의미.
+	uint64_t fixed_hg[16]; // TODO lc_hg 대체
+	/* lock 으로 보호 end */
+	spinlock_t lock;
+
+	// 실시간으로 업데이트됨. 1초마다 초기화됨.
+	struct mtat_debug_info debug;
+
+	struct access_histogram hg;
 };
 
 enum hotness_types {
@@ -38,15 +75,6 @@ enum hotness_types {
 
 #define CXL_MODE
 
-struct access_histogram {
-	uint64_t hg[16];
-	spinlock_t lock;
-
-	uint64_t nr_sampled;
-	uint64_t hot_threshold;
-	uint64_t warm_threshold;
-};
-
 // physical page를 나타냄.
 // list를 통해 할당되고 안되고를 표현.
 // 또한 hot인지 cold인지도 list를 통해 표현함.
@@ -55,7 +83,7 @@ struct mtat_page {
 	uint64_t pfn;
 	uint64_t accesses;
 	int hotness;
-	int pids_idx;
+	int apps_idx; // TODO
 	int nid;
 	int hg_idx;
 	struct rhash_head node;
@@ -99,12 +127,12 @@ struct perf_sample {
  * Migration
  */
 enum migration_modes {
-	SOLORUN,
-	CORUN
+	MTAT,
+	HEMEM,
+	MEMTIS
 };
 
-//#define MTAT_MIGRATION_MODE SOLORUN
-#define MTAT_MIGRATION_MODE CORUN // LC, BE 순으로 실행해야함.
+#define MTAT_MIGRATION_MODE MTAT
 //#define MTAT_MIGRATION_MODE HEMEM
 //#define MTAT_MIGRATION_MODE TEST_MODE
 #define KMIGRATED_CPU 5
@@ -116,8 +144,22 @@ struct migration_target_control {
 };
 
 /*
- * Debug
+ * Sysfs
  */
-#define KDEBUGD_CPU 6
+struct mtat_sysfs_app_dir {
+	struct kobject kobj;
+	int app_idx;
+};
+
+struct mtat_sysfs_apps_dir {
+	struct kobject kobj;
+	struct mtat_sysfs_app_dir app_dirs[MAX_APPS];
+};
+
+struct mtat_sysfs_ui_dir {
+	struct kobject kobj;
+	struct mtat_sysfs_apps_dir *apps_dir;
+};
+
 
 #endif /* __MTAT__ */
