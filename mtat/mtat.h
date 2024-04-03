@@ -49,14 +49,14 @@ struct app_struct {
 	/* lock 으로 보호 start */
 	uint64_t set_dram_size;
 	// debug thread가 1초마다 업데이트. 즉, 1초동안 쌓인 샘플 수를 의미.
-	uint64_t nr_total_sampled; // TODO lc_nr_sampled 대체
+	uint64_t nr_total_sampled;
 	uint64_t nr_fmem_read;
 	uint64_t nr_smem_read;
 	// migration thread가 1ms마다 업데이트. migration 할때마다 업데이트.
-	uint64_t dram_pages; // TODO lc_dram_pages 대체
-	uint64_t total_pages; // TODO lc_total_pages 대체
+	uint64_t dram_pages; 
+	uint64_t total_pages;
 	// cooling thread가 1초마다 업데이트. 즉, 1초동안 쌓인 histogram을 의미.
-	uint64_t fixed_hg[16]; // TODO lc_hg 대체
+	uint64_t fixed_hg[16];
 	/* lock 으로 보호 end */
 	spinlock_t lock;
 

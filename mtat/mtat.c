@@ -215,7 +215,6 @@ static void init_debug(struct mtat_debug_info *debug)
 	spin_lock_init(&debug->lock);
 }
 
-// TODO: app_struct에 추가한거 확인하고 반영하기
 static void init_apps(void)
 {
 	int i;
@@ -993,7 +992,6 @@ static void reserve_page(struct hstate *h, int nid, pid_t pid,
 	m_page->nid = nid;
 	m_page->accesses = 0;
 	m_page->hg_idx = 0;
-	page_list_del(m_page, &f_pages[nid]);
 	page_list_add(m_page, &mtat_pages[COLD][app_idx][nid]);
 
 	list_add_tail(&m_page->t_list, &total_pages[app_idx]);
@@ -1027,6 +1025,10 @@ static struct page *__mtat_allocate_page(struct hstate *h, int nid, pid_t pid)
 			continue;
 		spin_lock(&f_pages[i].lock);
 		m_page = list_first_entry_or_null(&f_pages[i].list, struct mtat_page, list);
+		if (m_page) {
+			list_del(&m_page->list);
+			f_pages[i].num_pages--;
+		}
 		spin_unlock(&f_pages[i].lock);
 
 		if (m_page)
@@ -1118,6 +1120,10 @@ static struct page *mtat_alloc_migration_target(struct page *old, unsigned long 
 
 	spin_lock(&f_pages[mtc->nid].lock);
 	m_page = list_first_entry_or_null(&f_pages[mtc->nid].list, struct mtat_page, list);
+	if (m_page) {
+		list_del(&m_page->list);
+		f_pages[mtc->nid].num_pages--;
+	}
 	spin_unlock(&f_pages[mtc->nid].lock);
 
 	if (m_page) {
