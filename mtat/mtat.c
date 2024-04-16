@@ -343,7 +343,7 @@ static void print_debug(struct mtat_debug_info *debug)
 
 	// Lock 굳이 안잡음. 어차피 눈으로 확인하는 용도라서 값이 좀 틀려도 상관없음.
 	for (i = 0; i < 4; i++)
-		total_sampled = debug->nr_sampled[i];
+		total_sampled += debug->nr_sampled[i];
 	pr_info("total_sampled: %llu\n", total_sampled);
 	pr_info("----DRAM_READ: %llu\n", debug->nr_sampled[0]);
 #ifdef CXL_MODE
@@ -352,7 +352,6 @@ static void print_debug(struct mtat_debug_info *debug)
 	pr_info("----PMEM_READ: %llu\n", debug->nr_sampled[1]);
 #endif
 	pr_info("----STORE_ALL: %llu\n", debug->nr_sampled[3]);
-	pr_info("nr_found: %llu\n", debug->nr_found);
 	pr_info("nr_cooled: %llu\n", debug->nr_cooled);
 	pr_info("nr_migrated: %llu MB\n", debug->nr_migrated); //TODO
 }
@@ -430,7 +429,6 @@ static void clear_debug_stats(void)
 		spin_lock(&debug->lock);
 		for (j = 0; j < 4; j++)
 			debug->nr_sampled[j] = 0;
-		debug->nr_found = 0;
 		debug->nr_cooled = 0;
 		debug->nr_migrated = 0;
 		spin_unlock(&debug->lock);
@@ -601,7 +599,6 @@ static void pebs_sample(uint64_t pfn, size_t config)
 	hg = &app->hg;
 
 	spin_lock(&debug->lock);
-	debug->nr_found++;
 	if (configs[config] == DRAM_READ)
 		debug->nr_sampled[0]++;
 	else if (configs[config] == PMEM_READ)
@@ -953,13 +950,18 @@ static void reserve_page(struct hstate *h, int nid, pid_t pid,
 	int i, app_idx;
 	bool need_add_dir = false;
 
-	/*
-	if (MTAT_MIGRATION_MODE == HEMEM) {
-		i = 0;
-		pids[0] = 0;
+	if (MTAT_MIGRATION_MODE != MTAT) {
+		app_idx = 0;
+		app = &apps[app_idx];
+		spin_lock(&app->lock);
+		if (app->pid == PID_NONE) {
+			app->pid = 0;
+			spin_unlock(&app->lock);
+			mtat_sysfs_apps_dir_add_dirs(mtat_sysfs->apps_dir, app_idx);
+		} else
+			spin_unlock(&app->lock);
 		goto m_page_init;
 	}
-	*/
 
 	for (i = 0; i < MAX_APPS; i++) {
 		app = &apps[i];
@@ -982,6 +984,7 @@ static void reserve_page(struct hstate *h, int nid, pid_t pid,
 		return;
 	}
 
+m_page_init:
 	hg = &app->hg;
 
 	spin_lock(&total_pages_lock[app_idx]);
@@ -1280,6 +1283,7 @@ static void do_migration(void)
 {
 	switch(MTAT_MIGRATION_MODE) {
 	case MTAT:
+	case MEMTIS:
 		mtat_migration();
 		break;
 	}
