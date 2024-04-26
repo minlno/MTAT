@@ -47,6 +47,10 @@ struct app_struct {
 	int pid;
 
 	/* lock 으로 보호 start */
+	int _pids[MAX_APPS]; // for memtis
+	uint64_t _dram_pages[MAX_APPS]; // for memtis
+	uint64_t _total_pages[MAX_APPS]; // for memtis
+
 	uint64_t set_dram_size;
 	// debug thread가 1초마다 업데이트. 즉, 1초동안 쌓인 샘플 수를 의미.
 	uint64_t nr_total_sampled;
@@ -83,13 +87,14 @@ struct mtat_page {
 	uint64_t pfn;
 	uint64_t accesses;
 	int hotness;
-	int apps_idx; // TODO
+	int apps_idx; 
 	int nid;
 	int hg_idx;
 	struct rhash_head node;
 	struct list_head list;
 	struct list_head t_list;
 	spinlock_t lock;
+	int pids_idx; // for memtis
 };
 
 struct mtat_page *alloc_and_init_mtat_page(struct page *page);
@@ -97,6 +102,7 @@ struct mtat_page *alloc_and_init_mtat_page(struct page *page);
 struct page_list {
 	struct list_head list;
 	int num_pages;
+	int num_pages_pid[MAX_APPS]; // for memtis
 	spinlock_t lock;
 };
 
@@ -147,9 +153,15 @@ struct migration_target_control {
 /*
  * Sysfs
  */
+struct mtat_sysfs_memtis_dir {
+	struct kobject kobj;
+	int pids_idx;
+};
+
 struct mtat_sysfs_app_dir {
 	struct kobject kobj;
 	int app_idx;
+	struct mtat_sysfs_memtis_dir memtis_dirs[MAX_APPS];
 };
 
 struct mtat_sysfs_apps_dir {

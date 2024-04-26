@@ -24,6 +24,7 @@ static unsigned long min_hot_threshold = 1;
  */
 struct mtat_sysfs_ui_dir *mtat_sysfs;
 static int mtat_sysfs_apps_dir_add_dirs(struct mtat_sysfs_apps_dir *apps_dir, int app_idx);
+static int mtat_sysfs_app_dir_add_dirs(struct mtat_sysfs_apps_dir *apps_dir, int pids_idx);
 static unsigned long migrate_on = 0;
 static unsigned long pebs_on = 1;
 static unsigned long mtat_debug_on = 1;
@@ -217,7 +218,7 @@ static void init_debug(struct mtat_debug_info *debug)
 
 static void init_apps(void)
 {
-	int i;
+	int i, j;
 
 	for (i = 0; i < MAX_APPS; i++) {
 		apps[i].pid = PID_NONE;
@@ -225,6 +226,9 @@ static void init_apps(void)
 
 		init_debug(&apps[i].debug);
 		init_hg(&apps[i].hg);
+		for (j = 0; j < MAX_APPS; j++) {
+			apps[i]._pids[j] = PID_NONE;
+		}
 	}
 }
 
@@ -271,26 +275,48 @@ int get_num_pages(struct page_list *pl)
 	return num_pages;
 }
 
+int get_num_pages_pid(struct page_list *pl, int pids_idx)
+{
+	int num_pages;
+
+	spin_lock(&pl->lock);
+	num_pages = pl->num_pages_pid[pids_idx];
+	spin_unlock(&pl->lock);
+
+	return num_pages;
+}
+
 void page_list_del(struct mtat_page *m_page, struct page_list *pl)
 {
+	int pids_idx = m_page->pids_idx;
+
 	spin_lock(&pl->lock);
 	list_del(&m_page->list);
 	pl->num_pages--;
+	if (MTAT_MIGRATION_MODE != MTAT) 
+		pl->num_pages_pid[pids_idx]--;
 	spin_unlock(&pl->lock);
 }
 
 void page_list_add(struct mtat_page *m_page, struct page_list *pl)
 {
+	int pids_idx = m_page->pids_idx;
+
 	spin_lock(&pl->lock);
 	list_add_tail(&m_page->list, &pl->list);
 	pl->num_pages++;
+	if (MTAT_MIGRATION_MODE != MTAT) 
+		pl->num_pages_pid[pids_idx]++;
 	spin_unlock(&pl->lock);
 }
 
 void init_page_list(struct page_list *pl)
 {
+	int i;
 	INIT_LIST_HEAD(&pl->list);
 	pl->num_pages = 0;
+	for (i = 0; i < MAX_APPS; i++)
+		pl->num_pages_pid[i] = 0;
 	spin_lock_init(&pl->lock);
 }
 
@@ -353,7 +379,7 @@ static void print_debug(struct mtat_debug_info *debug)
 #endif
 	pr_info("----STORE_ALL: %llu\n", debug->nr_sampled[3]);
 	pr_info("nr_cooled: %llu\n", debug->nr_cooled);
-	pr_info("nr_migrated: %llu MB\n", debug->nr_migrated); //TODO
+	pr_info("nr_migrated: %llu MB\n", debug->nr_migrated);
 }
 
 static void print_debug_stats(void)
@@ -947,7 +973,7 @@ static void reserve_page(struct hstate *h, int nid, pid_t pid,
 {
 	struct app_struct *app;
 	struct access_histogram *hg;
-	int i, app_idx;
+	int i, app_idx, pids_idx;
 	bool need_add_dir = false;
 
 	if (MTAT_MIGRATION_MODE != MTAT) {
@@ -956,10 +982,25 @@ static void reserve_page(struct hstate *h, int nid, pid_t pid,
 		spin_lock(&app->lock);
 		if (app->pid == PID_NONE) {
 			app->pid = 0;
-			spin_unlock(&app->lock);
 			mtat_sysfs_apps_dir_add_dirs(mtat_sysfs->apps_dir, app_idx);
-		} else
-			spin_unlock(&app->lock);
+		}
+		for (i = 0; i < MAX_APPS; i++) {
+			if (app->_pids[i] == PID_NONE || app->_pids[i] == pid) {
+				pids_idx = i;
+				if (app->_pids[i] == PID_NONE) {
+					pr_info("%dth new app is added - pid: %d\n", i, pid);
+					app->_pids[i] = pid;
+					mtat_sysfs_app_dir_add_dirs(mtat_sysfs->apps_dir, pids_idx);
+				}
+				break;
+			}
+		}
+		spin_unlock(&app->lock);
+
+		if (i == MAX_APPS) {
+			pr_err("Too many apps!\n");
+			return;
+		}
 		goto m_page_init;
 	}
 
@@ -992,6 +1033,8 @@ m_page_init:
 
 	m_page->hotness = COLD;
 	m_page->apps_idx = app_idx;
+	if (MTAT_MIGRATION_MODE != MTAT) 
+		m_page->pids_idx = pids_idx;
 	m_page->nid = nid;
 	m_page->accesses = 0;
 	m_page->hg_idx = 0;
@@ -1138,7 +1181,8 @@ static struct page *mtat_alloc_migration_target(struct page *old, unsigned long 
 	return page;
 }
 
-static unsigned int migrate_page_list(struct list_head *page_list, int nid, struct app_struct *app, int hotness)
+static unsigned int migrate_page_list(struct list_head *page_list, int nid, int pid, 
+									  struct app_struct *app, int hotness)
 {
 	unsigned int nr_migrated_pages = 0;
 	struct page *page;
@@ -1147,7 +1191,7 @@ static unsigned int migrate_page_list(struct list_head *page_list, int nid, stru
 
 	struct migration_target_control mtc = {
 		.nid = nid,
-		.pid = app->pid,
+		.pid = pid,
 		.hotness = hotness
 	};
 
@@ -1268,12 +1312,87 @@ static void mtat_migration(void)
 	/* Do Migration */
 	for (i = 0; i < app_num; i++) {
 		for (j = NR_HOTNESS_TYPES-1; j >= 0; j--) {
-			migrate_page_list(&demote_pages[i][j], SLOWMEM, &apps[i], j);
+			migrate_page_list(&demote_pages[i][j], SLOWMEM, apps[i].pid, &apps[i], j);
 		}
 	}
 	for (i = 0; i < app_num; i++) {
 		for (j = 0; j < NR_HOTNESS_TYPES; j++) {
-			migrate_page_list(&promote_pages[i][j], FASTMEM, &apps[i], j);	
+			migrate_page_list(&promote_pages[i][j], FASTMEM, apps[i].pid, &apps[i], j);	
+		}
+	}
+}
+
+static unsigned int memtis_isolate_mtat_pages(struct page_list *from, 
+		struct list_head *to, int target_nr)
+{
+	struct mtat_page *m_page = NULL;
+	int nr = 0;
+	int pids_idx;
+
+	if (target_nr == 0)
+		return 0;
+
+	spin_lock(&from->lock);
+	list_for_each_entry(m_page, &from->list, list) {
+		if (nr >= target_nr)
+			break;
+		pids_idx = m_page->pids_idx;
+		if (isolate_hugetlb(m_page->page, &to[pids_idx]))
+			continue;
+		nr++;
+	}
+	spin_unlock(&from->lock);
+
+	return nr;
+}
+
+static void memtis_migration(void)
+{
+	struct list_head promote_pages[NR_HOTNESS_TYPES][MAX_APPS];
+	struct list_head demote_pages[NR_HOTNESS_TYPES][MAX_APPS];
+	struct app_struct *app;
+	int target_promote[NR_HOTNESS_TYPES], target_demote[NR_HOTNESS_TYPES]; 
+	int i, j;
+	uint64_t dram_size;
+
+	for (i = 0; i < MAX_APPS; i++) {
+		for (j = 0; j < NR_HOTNESS_TYPES; j++) {
+			INIT_LIST_HEAD(&promote_pages[j][i]);
+			INIT_LIST_HEAD(&demote_pages[j][i]);
+			target_promote[j] = 0;
+			target_demote[j] = 0;
+		}
+	}
+
+	app = &apps[0];
+
+	if (app->pid == PID_NONE)
+		return;
+
+	spin_lock(&app->lock);
+	dram_size = app->set_dram_size;
+	spin_unlock(&app->lock);
+	calculate_migration_target_size(target_promote, target_demote, 0, dram_size);
+
+	/* Isolate pages for migration */
+	for (i = 0; i < NR_HOTNESS_TYPES; i++) {
+		memtis_isolate_mtat_pages(&mtat_pages[i][0][SLOWMEM], promote_pages[i], target_promote[i]);
+		memtis_isolate_mtat_pages(&mtat_pages[i][0][FASTMEM], demote_pages[i], target_demote[i]);
+	}
+
+	/* Do Migration */
+	for (i = 0; i < MAX_APPS; i++) {
+		if (app->_pids[i] == PID_NONE)
+			break;
+		for (j = NR_HOTNESS_TYPES-1; j >= 0; j--) {
+			migrate_page_list(&demote_pages[j][i], SLOWMEM, app->_pids[i], app, j);
+		}
+	}
+	for (i = 0; i < MAX_APPS; i++) {
+		if (app->_pids[i] == PID_NONE)
+			break;
+		for (j = 0; j < NR_HOTNESS_TYPES; j++) {
+			migrate_page_list(&promote_pages[j][i], FASTMEM, app->_pids[i], app, j);	
 		}
 	}
 }
@@ -1283,8 +1402,10 @@ static void do_migration(void)
 {
 	switch(MTAT_MIGRATION_MODE) {
 	case MTAT:
-	case MEMTIS:
 		mtat_migration();
+		break;
+	case MEMTIS:
+		memtis_migration();
 		break;
 	}
 }
@@ -1309,7 +1430,9 @@ static void update_histogram(void)
 void update_app_pages_info(void)
 {
 	struct app_struct *app;
-	int i, j, tmp, dram_pages, total_pages;
+	int i, j, k, tmp, dram_pages, total_pages;
+	int _dram_pages[MAX_APPS]={0,};
+	int _total_pages[MAX_APPS] = {0,};
 	for (i = 0; i < MAX_APPS; i++) {
 		app = &apps[i];
 		if (app->pid == PID_NONE) {
@@ -1322,12 +1445,30 @@ void update_app_pages_info(void)
 			tmp = get_num_pages(&mtat_pages[j][i][FASTMEM]);
 			dram_pages += tmp;
 			total_pages += tmp + get_num_pages(&mtat_pages[j][i][SLOWMEM]);
+			if (MTAT_MIGRATION_MODE != MTAT) {
+				for (k = 0; k < MAX_APPS; k++) {
+					if (app->_pids[k] == PID_NONE)
+						break;
+					tmp = get_num_pages_pid(&mtat_pages[j][i][FASTMEM], k);
+					_dram_pages[k] += tmp;
+					_total_pages[k] += tmp + get_num_pages_pid(&mtat_pages[j][i][SLOWMEM], k);
+				}
+			}
 		}
 
 		spin_lock(&app->lock);
 
 		app->dram_pages = dram_pages;
 		app->total_pages = total_pages;
+
+		if (MTAT_MIGRATION_MODE != MTAT) {
+			for (k = 0; k < MAX_APPS; k++) {
+				if (app->_pids[k] == PID_NONE)
+					break;
+				app->_dram_pages[k] = _dram_pages[k];
+				app->_total_pages[k] = _total_pages[k];
+			}
+		}
 
 		spin_unlock(&app->lock);
 
@@ -1477,8 +1618,75 @@ static struct kobj_attribute mtat_debug_on_attr = __ATTR_RW_MODE(mtat_debug_on, 
 static struct kobj_attribute total_dram_pages_attr = __ATTR_RO_MODE(total_dram_pages, 0400);
 
 /*
+ * memtis_dir
+ */
+static ssize_t _dram_pages_show(struct kobject *kobj, struct kobj_attribute *attr,
+		char *buf)
+{
+	struct mtat_sysfs_memtis_dir *memtis_dir =container_of(kobj, struct mtat_sysfs_memtis_dir, kobj);
+	struct app_struct *app = &apps[0];
+	int pids_idx = memtis_dir->pids_idx;
+	int len = 0;
+
+	spin_lock(&app->lock);
+	len = snprintf(buf, PAGE_SIZE, "%llu\n", app->_dram_pages[pids_idx]);
+	spin_unlock(&app->lock);
+
+	return len;
+}
+
+static ssize_t _total_pages_show(struct kobject *kobj, struct kobj_attribute *attr,
+		char *buf)
+{
+	struct mtat_sysfs_memtis_dir *memtis_dir =container_of(kobj, struct mtat_sysfs_memtis_dir, kobj);
+	struct app_struct *app = &apps[0];
+	int pids_idx = memtis_dir->pids_idx;
+	int len = 0;
+
+	spin_lock(&app->lock);
+	len = snprintf(buf, PAGE_SIZE, "%llu\n", app->_total_pages[pids_idx]);
+	spin_unlock(&app->lock);
+
+	return len;
+}
+
+static struct kobj_attribute _dram_pages_attr = __ATTR_RO_MODE(_dram_pages, 0400);
+static struct kobj_attribute _total_pages_attr = __ATTR_RO_MODE(_total_pages, 0400);
+
+static struct attribute *mtat_sysfs_memtis_dir_attrs[] = {
+	&_dram_pages_attr.attr,
+	&_total_pages_attr.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(mtat_sysfs_memtis_dir);
+
+static struct kobj_type mtat_sysfs_memtis_dir_ktype = {
+	.sysfs_ops = &kobj_sysfs_ops,
+	.default_groups = mtat_sysfs_memtis_dir_groups,
+};
+
+/*
  * app_dir
  */
+static int mtat_sysfs_app_dir_add_dirs(struct mtat_sysfs_apps_dir *apps_dir, int pids_idx)
+{
+	struct mtat_sysfs_app_dir *app_dir = &apps_dir->app_dirs[0];
+	struct mtat_sysfs_memtis_dir *memtis_dir = &app_dir->memtis_dirs[pids_idx];
+	struct app_struct *app = &apps[0];
+	int pid = app->_pids[pids_idx];
+	int err;
+
+	memtis_dir->pids_idx = pids_idx;
+
+	err = kobject_init_and_add(&memtis_dir->kobj,
+			&mtat_sysfs_memtis_dir_ktype, &app_dir->kobj,
+			"%d", pid);
+	if (err)
+		kobject_put(&memtis_dir->kobj);
+
+	return err;
+}
+
 static ssize_t set_dram_size_store(struct kobject *kobj, struct kobj_attribute *attr,
 		const char *buf, size_t count)
 {
@@ -1635,13 +1843,21 @@ static struct kobj_type mtat_sysfs_app_dir_ktype = {
 static struct mtat_sysfs_apps_dir *mtat_sysfs_apps_dir_alloc(void)
 {
 	struct mtat_sysfs_apps_dir *apps_dir;
-	int i;
+	struct mtat_sysfs_app_dir *app_dir;
+	struct mtat_sysfs_memtis_dir *memtis_dir;
+	int i, j;
 	apps_dir = kzalloc(sizeof(struct mtat_sysfs_apps_dir), GFP_KERNEL);
 	if (!apps_dir)
 		goto out;
 	
-	for (i = 0; i < MAX_APPS; i++)
-		apps_dir->app_dirs[i].app_idx = PID_NONE;
+	for (i = 0; i < MAX_APPS; i++) {
+		app_dir = &apps_dir->app_dirs[i];
+		app_dir->app_idx = PID_NONE;
+		for (j = 0; j < MAX_APPS; j++) {
+			memtis_dir = &app_dir->memtis_dirs[j];
+			memtis_dir->pids_idx = PID_NONE;
+		}
+	}
 
 out:
 	return apps_dir;
@@ -1754,13 +1970,20 @@ static void mtat_sysfs_exit(void)
 {
 	struct mtat_sysfs_apps_dir *apps_dir;
 	struct mtat_sysfs_app_dir *app_dir;
-	int i;
+	struct mtat_sysfs_memtis_dir *memtis_dir;
+	int i,j;
 	if (mtat_sysfs) {
 		apps_dir = mtat_sysfs->apps_dir;
 		for (i = 0; i < MAX_APPS; i++) {
 			app_dir = &apps_dir->app_dirs[i];
-			if (app_dir->app_idx != PID_NONE)
-				kobject_put(&app_dir->kobj);
+			if (app_dir->app_idx == PID_NONE)
+				continue;
+			for (j = 0; j < MAX_APPS; j++) {
+				memtis_dir = &app_dir->memtis_dirs[j];
+				if (memtis_dir->pids_idx != PID_NONE)
+					kobject_put(&memtis_dir->kobj);
+			}
+			kobject_put(&app_dir->kobj);
 		}
 		kobject_put(&apps_dir->kobj);
 		kobject_put(&mtat_sysfs->kobj);
