@@ -78,7 +78,7 @@ static size_t configs[] = { DRAM_READ, PMEM_READ, STORE_ALL };
 #endif
 
 static size_t cpus[] = {16,17,18,19,20,21,22,23,
-					   48,49,50,51,52,53,54,55,56,57,58,59,
+					   48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,
 					   64,65,66,67,68,69,70,71};
 //static size_t cpus[] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,
 //					   48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71};
@@ -1323,23 +1323,50 @@ static void mtat_migration(void)
 }
 
 static unsigned int memtis_isolate_mtat_pages(struct page_list *from, 
-		struct list_head *to, int target_nr)
+		struct list_head *to, int target_nr, bool demote)
 {
 	struct mtat_page *m_page = NULL;
 	int nr = 0;
-	int pids_idx;
+	int pids_idx, i;
+	int added_pages[MAX_APPS] = {0, };
+	uint64_t set_dram_size[MAX_APPS] = {0, };
+	struct app_struct *app;
 
 	if (target_nr == 0)
 		return 0;
+
+	app = &apps[0];
+	spin_lock(&app->lock);
+	for (i = 0; i < MAX_APPS; i++) {
+		set_dram_size[i] = app->_set_dram_size[i];
+	}
+	spin_unlock(&app->lock);
 
 	spin_lock(&from->lock);
 	list_for_each_entry(m_page, &from->list, list) {
 		if (nr >= target_nr)
 			break;
 		pids_idx = m_page->pids_idx;
+
+		/*
+		if (demote) {
+			if ((app->_dram_pages[pids_idx] - added_pages[pids_idx] - 1) < set_dram_size[pids_idx])
+				continue;
+		} else {
+			if ((app->_dram_pages[pids_idx] + added_pages[pids_idx] + 1) > set_dram_size[pids_idx])
+				continue;
+		}
+		*/
+
+		if (!demote) {
+			if ((app->_dram_pages[pids_idx] + added_pages[pids_idx] + 1) > set_dram_size[pids_idx])
+				continue;
+		}
+
 		if (isolate_hugetlb(m_page->page, &to[pids_idx]))
 			continue;
 		nr++;
+		added_pages[pids_idx]++;
 	}
 	spin_unlock(&from->lock);
 
@@ -1376,8 +1403,8 @@ static void memtis_migration(void)
 
 	/* Isolate pages for migration */
 	for (i = 0; i < NR_HOTNESS_TYPES; i++) {
-		memtis_isolate_mtat_pages(&mtat_pages[i][0][SLOWMEM], promote_pages[i], target_promote[i]);
-		memtis_isolate_mtat_pages(&mtat_pages[i][0][FASTMEM], demote_pages[i], target_demote[i]);
+		memtis_isolate_mtat_pages(&mtat_pages[i][0][SLOWMEM], promote_pages[i], target_promote[i], false);
+		memtis_isolate_mtat_pages(&mtat_pages[i][0][FASTMEM], demote_pages[i], target_demote[i], true);
 	}
 
 	/* Do Migration */
@@ -1620,6 +1647,41 @@ static struct kobj_attribute total_dram_pages_attr = __ATTR_RO_MODE(total_dram_p
 /*
  * memtis_dir
  */
+static ssize_t _set_dram_size_show(struct kobject *kobj, struct kobj_attribute *attr,
+		char *buf)
+{
+	struct mtat_sysfs_memtis_dir *memtis_dir =container_of(kobj, struct mtat_sysfs_memtis_dir, kobj);
+	struct app_struct *app = &apps[0];
+	int pids_idx = memtis_dir->pids_idx;
+	int len = 0;
+
+	spin_lock(&app->lock);
+	len = snprintf(buf, PAGE_SIZE, "%llu\n", app->_set_dram_size[pids_idx]);
+	spin_unlock(&app->lock);
+
+	return len;
+}
+
+static ssize_t _set_dram_size_store(struct kobject *kobj, struct kobj_attribute *attr,
+		const char *buf, size_t count)
+{
+	struct mtat_sysfs_memtis_dir *memtis_dir =container_of(kobj, struct mtat_sysfs_memtis_dir, kobj);
+	struct app_struct *app = &apps[0];
+	int pids_idx = memtis_dir->pids_idx;
+	unsigned long input  = 0;
+	int err;
+
+	err = kstrtoul(buf, 0, &input);
+	if (err)
+		return err;
+
+	spin_lock(&app->lock);
+	app->_set_dram_size[pids_idx] = input;
+	spin_unlock(&app->lock);
+
+	return count;
+}
+
 static ssize_t _dram_pages_show(struct kobject *kobj, struct kobj_attribute *attr,
 		char *buf)
 {
@@ -1627,6 +1689,7 @@ static ssize_t _dram_pages_show(struct kobject *kobj, struct kobj_attribute *att
 	struct app_struct *app = &apps[0];
 	int pids_idx = memtis_dir->pids_idx;
 	int len = 0;
+
 
 	spin_lock(&app->lock);
 	len = snprintf(buf, PAGE_SIZE, "%llu\n", app->_dram_pages[pids_idx]);
@@ -1650,10 +1713,12 @@ static ssize_t _total_pages_show(struct kobject *kobj, struct kobj_attribute *at
 	return len;
 }
 
+static struct kobj_attribute _set_dram_size_attr = __ATTR_RW_MODE(_set_dram_size, 0600);
 static struct kobj_attribute _dram_pages_attr = __ATTR_RO_MODE(_dram_pages, 0400);
 static struct kobj_attribute _total_pages_attr = __ATTR_RO_MODE(_total_pages, 0400);
 
 static struct attribute *mtat_sysfs_memtis_dir_attrs[] = {
+	&_set_dram_size_attr.attr,
 	&_dram_pages_attr.attr,
 	&_total_pages_attr.attr,
 	NULL,

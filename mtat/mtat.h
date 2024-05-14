@@ -50,6 +50,7 @@ struct app_struct {
 	int _pids[MAX_APPS]; // for memtis
 	uint64_t _dram_pages[MAX_APPS]; // for memtis
 	uint64_t _total_pages[MAX_APPS]; // for memtis
+	uint64_t _set_dram_size[MAX_APPS]; // for memtis
 
 	uint64_t set_dram_size;
 	// debug thread가 1초마다 업데이트. 즉, 1초동안 쌓인 샘플 수를 의미.
@@ -138,8 +139,8 @@ enum migration_modes {
 	MEMTIS
 };
 
-//#define MTAT_MIGRATION_MODE MTAT
-#define MTAT_MIGRATION_MODE MEMTIS
+#define MTAT_MIGRATION_MODE MTAT
+//#define MTAT_MIGRATION_MODE MEMTIS
 //#define MTAT_MIGRATION_MODE HEMEM
 //#define MTAT_MIGRATION_MODE TEST_MODE
 #define KMIGRATED_CPU 5
