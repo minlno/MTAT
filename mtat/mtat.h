@@ -20,7 +20,7 @@
 /*
  * Debug
  */
-#define KDEBUGD_CPU 6
+#define KDEBUGD_CPU 50
 
 struct mtat_debug_info {
 	uint64_t nr_sampled[4];
@@ -128,7 +128,7 @@ struct perf_sample {
 #define DRAM_READ 0x01d3
 #define STORE_ALL 0x82d0
 #define SAMPLE_PERIOD_PEBS 5003 // 10007 5003
-#define KPEBSD_CPU 4
+#define KPEBSD_CPU 48
 
 /*
  * Migration
@@ -143,7 +143,7 @@ enum migration_modes {
 //#define MTAT_MIGRATION_MODE MEMTIS
 //#define MTAT_MIGRATION_MODE HEMEM
 //#define MTAT_MIGRATION_MODE TEST_MODE
-#define KMIGRATED_CPU 5
+#define KMIGRATED_CPU 49
 
 struct migration_target_control {
 	int nid;

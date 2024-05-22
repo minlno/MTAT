@@ -468,10 +468,11 @@ static int kdebugd_main(void *data)
 	mtat_set_cpu_affinity(KDEBUGD_CPU);
 
 	while (!kthread_should_stop()) {
-		if (mtat_debug_on)
+		if (mtat_debug_on) {
 			print_debug_stats();
-		update_debug_stats();
-		clear_debug_stats();
+			update_debug_stats();
+			clear_debug_stats();
+		}
 
 		msleep(cooling_period);
 	}
@@ -1047,15 +1048,15 @@ m_page_init:
 	hg->histogram[0]++;
 
 	spin_unlock(&hg->lock);
-	spin_unlock(&m_page->lock);
-	spin_unlock(&total_pages_lock[app_idx]);
-
 
 	list_move(&m_page->page->lru, &h->hugepage_activelist);
 	set_page_count(m_page->page, 1);
 	ClearHPageFreed(m_page->page);
 	h->free_huge_pages--;
 	h->free_huge_pages_node[nid]--;
+
+	spin_unlock(&m_page->lock);
+	spin_unlock(&total_pages_lock[app_idx]);
 }
 
 static struct page *__mtat_allocate_page(struct hstate *h, int nid, pid_t pid)
@@ -1218,20 +1219,25 @@ static unsigned int isolate_mtat_pages(struct page_list *from,
 		struct list_head *to, int target_nr)
 {
 	struct mtat_page *m_page = NULL;
+	struct mtat_page *tmp = NULL;
 	int nr = 0;
 
 	if (target_nr == 0)
 		return 0;
 
-	spin_lock(&from->lock);
-	list_for_each_entry(m_page, &from->list, list) {
+	list_for_each_entry_safe(m_page, tmp, &from->list, list) {
 		if (nr >= target_nr)
 			break;
-		if (isolate_hugetlb(m_page->page, to))
+
+		spin_lock(&m_page->lock);
+		if (isolate_hugetlb(m_page->page, to)) {
+			spin_unlock(&m_page->lock);
 			continue;
+		}
+		spin_unlock(&m_page->lock);
+
 		nr++;
 	}
-	spin_unlock(&from->lock);
 
 	return nr;
 }
