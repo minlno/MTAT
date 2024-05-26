@@ -16,7 +16,7 @@ static int SLOWMEM;
 
 // ms, cooling_period는 mtat manager의 정책 결정 주기와 동일해야함.
 static unsigned long cooling_period = 1000; 
-static unsigned long mtat_migration_period = 1; // ms
+static unsigned long mtat_migration_page_limit = 100; // 2MB pages
 static unsigned long min_hot_threshold = 1;
 
 /*
@@ -195,7 +195,7 @@ static void hg_update_hot_threshold(struct access_histogram *hg, uint64_t dram_s
 
 	spin_lock(&hg->lock);
 	for (i = 15; i >= 0; i--) {
-		tmp += hg->histogram[i];
+		tmp += hg->fixed_hg[i];
 		if (tmp > dram_size) {
 			hg->hot_threshold = i+1;
 			hg->warm_threshold = i;
@@ -1242,7 +1242,7 @@ static unsigned int isolate_mtat_pages(struct page_list *from,
 	return nr;
 }
 
-static void calculate_migration_target_size(int *target_promote,
+static void memtis_calculate_migration_target_size(int *target_promote,
 		int *target_demote, int app_idx, int dram_size)
 {
 	int nr_fmem[NR_HOTNESS_TYPES], nr_smem[NR_HOTNESS_TYPES];
@@ -1277,14 +1277,66 @@ static void calculate_migration_target_size(int *target_promote,
 	}
 }
 
+static void calculate_migration_target_size(int *target_promote,
+		int *target_demote, int app_idx, int target_dram_size, 
+		int limit, int curr_dram_size)
+{
+	int nr_fmem[NR_HOTNESS_TYPES], nr_smem[NR_HOTNESS_TYPES];
+	int i, j;
+	int dram_distance = target_dram_size - curr_dram_size;
+
+	for (i = 0; i < NR_HOTNESS_TYPES; i++) {
+		nr_fmem[i] = get_num_pages(&mtat_pages[i][app_idx][FASTMEM]);
+		nr_smem[i] = get_num_pages(&mtat_pages[i][app_idx][SLOWMEM]);
+	}
+
+	if (dram_distance > 0) {
+// limit 만큼 smem의 hot, warm, cold에서 page를 promotion. 이때 차이가 limit보다 작다면, 딱 그만큼만 promote.
+		limit = min(dram_distance, limit);
+		for (i = 0; i < NR_HOTNESS_TYPES; i++) {
+			target_promote[i] = min(limit, nr_smem[i]);
+			limit -= target_promote[i];
+			if (limit == 0)
+				break;
+		}
+	} else if (dram_distance < 0) {
+// limit 만큼 fmem의 cold, warm, hot에서 page를 demotion. 이때 차이가 limit보다 작다면, 딱 그만큼만 demote.
+		dram_distance = (-1) * dram_distance;
+		limit = min(dram_distance, limit);
+		for (i = NR_HOTNESS_TYPES-1; i >= 0; i--) {
+			target_demote[i] = min(limit, nr_fmem[i]);
+			limit -= target_demote[i];
+			if (limit == 0)
+				break;
+		}
+	} else {
+		limit /= 2;
+		for (i = 0; i < NR_HOTNESS_TYPES; i++) {
+			int can_promote = min(limit, nr_smem[i]);
+			for (j = NR_HOTNESS_TYPES-1; j > i; j--) {
+				target_demote[j] = min(can_promote, nr_fmem[j]);
+				target_promote[i] += target_demote[j];
+				can_promote -= target_demote[j];
+				limit -= target_demote[j];
+				if (can_promote == 0)
+					break;
+			}
+			if (limit == 0)
+				break;
+		}
+	}
+}
+
 static void mtat_migration(void)
 {
 	struct list_head promote_pages[MAX_APPS][NR_HOTNESS_TYPES];
 	struct list_head demote_pages[MAX_APPS][NR_HOTNESS_TYPES];
 	struct app_struct *app;
 	int target_promote[MAX_APPS][NR_HOTNESS_TYPES], target_demote[MAX_APPS][NR_HOTNESS_TYPES]; 
-	int i, j, app_num;
-	uint64_t dram_size;
+	int i, j, app_num, app_num_dram;
+	uint64_t dram_size[MAX_APPS], set_dram_size[MAX_APPS];
+	int N = mtat_migration_page_limit;
+	int limit[MAX_APPS];
 
 	for (i = 0; i < MAX_APPS; i++) {
 		for (j = 0; j < NR_HOTNESS_TYPES; j++) {
@@ -1293,18 +1345,50 @@ static void mtat_migration(void)
 			target_promote[i][j] = 0;
 			target_demote[i][j] = 0;
 		}
+		limit[i] = 0;
+		dram_size[i] = 0;
+		set_dram_size[i] = 0;
 	}
 
+    //  N개의 페이지만 한번에 migration.
+	// 1. app 개수 세기
+	// 2. set dram size랑 dram 크기 안맞는 app 개수 세기
+	// 3. dram 크기 안맞는 app 이 있다면 N을 해당 app들에게만 분배하여 migration.
+	//
+	app_num_dram = 0;
 	for (i = 0; i < MAX_APPS; i++) {
 		app = &apps[i];
-		if (app->pid == PID_NONE) {
-			app_num = i;
+		if (app->pid == PID_NONE)
 			break;
-		}
+
 		spin_lock(&app->lock);
-		dram_size = app->set_dram_size;
+		dram_size[i] = app->dram_pages;
+		set_dram_size[i] = app->set_dram_size;
 		spin_unlock(&app->lock);
-		calculate_migration_target_size(target_promote[i], target_demote[i], i, dram_size);
+
+		if (dram_size[i] != set_dram_size[i])
+			app_num_dram += 1;
+	}
+	
+	app_num = i;
+
+	if (app_num_dram) {
+		for (i = 0; i < app_num; i++) {
+			if (dram_size[i] != set_dram_size[i])
+				limit[i] = N / app_num_dram;
+		}
+	} else {
+		for (i = 0; i < app_num; i++) {
+			limit[i] = N / app_num;
+		}
+	}
+
+	for (i = 0; i < app_num; i++) {
+		if (limit[i] == 0)
+			continue;
+
+		calculate_migration_target_size(target_promote[i], target_demote[i], i, 
+				set_dram_size[i], limit[i], dram_size[i]);
 	}
 
 	/* Isolate pages for migration */
@@ -1405,7 +1489,7 @@ static void memtis_migration(void)
 	spin_lock(&app->lock);
 	dram_size = app->set_dram_size;
 	spin_unlock(&app->lock);
-	calculate_migration_target_size(target_promote, target_demote, 0, dram_size);
+	memtis_calculate_migration_target_size(target_promote, target_demote, 0, dram_size);
 
 	/* Isolate pages for migration */
 	for (i = 0; i < NR_HOTNESS_TYPES; i++) {
@@ -1515,15 +1599,12 @@ static int kmigrated_main(void *data)
 	mtat_set_cpu_affinity(KMIGRATED_CPU);
 
 	while (!kthread_should_stop()) {
-		update_histogram();
-
 		if (migrate_on) {
 			do_migration();
 		}
 
 		update_app_pages_info();
 		
-		msleep(mtat_migration_period);
 		if (need_resched())
 			schedule();
 	}
@@ -1538,7 +1619,6 @@ static void update_fixed_hg(void)
 {
 	struct app_struct *app;
 	struct access_histogram *hg;
-	uint64_t tmp_hg[16];
 	int i, j;
 	for (i = 0; i < MAX_APPS; i++) {
 		app = &apps[i];
@@ -1548,13 +1628,8 @@ static void update_fixed_hg(void)
 		hg = &app->hg;
 		spin_lock(&hg->lock);
 		for (j = 0; j < 16; j++)
-			tmp_hg[j] = hg->histogram[j];
+			hg->fixed_hg[j] = hg->histogram[j];
 		spin_unlock(&hg->lock);
-
-		spin_lock(&app->lock);
-		for (j = 0; j < 16; j++)
-			app->fixed_hg[j] = tmp_hg[j];
-		spin_unlock(&app->lock);
 	}
 }
 
@@ -1566,6 +1641,7 @@ static int kcoolingd_main(void *data)
 
 	while (!kthread_should_stop()) {
 		update_fixed_hg();
+		update_histogram();
 		
 		periodic_cooling();
 		msleep(cooling_period);
@@ -1866,19 +1942,20 @@ static ssize_t histogram_show(struct kobject *kobj, struct kobj_attribute *attr,
 {
 	struct mtat_sysfs_app_dir *app_dir =container_of(kobj, struct mtat_sysfs_app_dir, kobj);
 	struct app_struct *app = &apps[app_dir->app_idx];
+	struct access_histogram *hg = &app->hg;
 	int i, len = 0, ret;
 	size_t buf_size = PAGE_SIZE;
 
-	spin_lock(&app->lock);
+	spin_lock(&hg->lock);
 	for (i = 0; i < 16; i++) {
-		ret = snprintf(buf + len, buf_size - len, "%llu ", app->fixed_hg[i]);
+		ret = snprintf(buf + len, buf_size - len, "%llu ", hg->fixed_hg[i]);
 
 		if (ret >= buf_size - len) 
 			break;
 
 		len += ret;
 	}
-	spin_unlock(&app->lock);
+	spin_unlock(&hg->lock);
 
 	return len;
 }

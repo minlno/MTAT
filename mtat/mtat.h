@@ -38,6 +38,8 @@ struct mtat_debug_info {
 
 struct access_histogram {
 	uint64_t histogram[16];
+	// cooling thread가 1초마다 업데이트. 즉, 1초동안 쌓인 histogram을 의미.
+	uint64_t fixed_hg[16];
 	uint64_t hot_threshold;
 	uint64_t warm_threshold;
 	spinlock_t lock;
@@ -60,8 +62,6 @@ struct app_struct {
 	// migration thread가 1ms마다 업데이트. migration 할때마다 업데이트.
 	uint64_t dram_pages; 
 	uint64_t total_pages;
-	// cooling thread가 1초마다 업데이트. 즉, 1초동안 쌓인 histogram을 의미.
-	uint64_t fixed_hg[16];
 	/* lock 으로 보호 end */
 	spinlock_t lock;
 
