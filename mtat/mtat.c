@@ -1225,19 +1225,34 @@ static unsigned int isolate_mtat_pages(struct page_list *from,
 	if (target_nr == 0)
 		return 0;
 
+	spin_lock(&from->lock);
 	list_for_each_entry_safe(m_page, tmp, &from->list, list) {
 		if (nr >= target_nr)
 			break;
 
-		spin_lock(&m_page->lock);
+		if (!m_page) {
+			pr_err("isolate_mtat_pages: mtat_page is NULL\n");
+			continue;
+		}
+		if (!m_page->page) {
+			pr_err("isolate_mtat_pages: mtat_page->page is NULL\n");
+			continue;
+		}
+
+
+		if (!spin_trylock(&m_page->lock))
+			continue;
+
 		if (isolate_hugetlb(m_page->page, to)) {
 			spin_unlock(&m_page->lock);
 			continue;
 		}
+
 		spin_unlock(&m_page->lock);
 
 		nr++;
 	}
+	spin_unlock(&from->lock);
 
 	return nr;
 }
